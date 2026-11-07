@@ -1,0 +1,16 @@
+# --- GUI / desktop automation ---
+PySide6>=6.6          # Qt UI (overlay, region selector, control panel)
+mss>=9.0.2           # fast cross-platform screen capture
+Pillow>=10.2.0       # image handling
+pytesseract>=0.3.10  # OCR engine wrapper (needs the Tesseract binary installed)
+pynput>=1.7.6        # global hotkeys
+keyboard>=0.13.5     # OPTIONAL fallback hotkey backend (Windows only, run as admin)
+
+# --- Input simulation ---
+pyautogui>=0.9.54    # mouse clicks + typing
+
+# --- AI API ---
+requests>=2.31.0     # OpenAI-compatible / Anthropic REST calls (no vendor SDK needed)
+
+# --- Optional: use a vision LLM instead of local OCR ---
+# openai>=1.30.0

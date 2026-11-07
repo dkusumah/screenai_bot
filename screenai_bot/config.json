@@ -1,0 +1,58 @@
+{
+  "ai": {
+    "provider": "openai",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0.2,
+    "max_tokens": 800,
+    "use_vision": false,
+    "timeout": 60
+  },
+  "ocr": {
+    "tesseract_cmd": null,
+    "language": "eng",
+    "psm": 6,
+    "preprocess": true,
+    "min_confidence": 45
+  },
+  "actions": {
+    "type_interval": 0.012,
+    "click_duration": 0.06,
+    "move_duration": 0.25,
+    "failsafe": true,
+    "pause_after_answer_ms": 350,
+    "confirm_before_action": true,
+    "focus_click": true,
+    "clear_field_shortcut": "ctrl+a"
+  },
+  "hotkeys": {
+    "select_region": "ctrl+alt+r",
+    "run": "ctrl+alt+enter",
+    "stop": "ctrl+alt+s",
+    "repeat_last": "ctrl+alt+l",
+    "paste_answer": "ctrl+alt+v",
+    "toggle_overlay": "ctrl+alt+h"
+  },
+  "prompt": {
+    "system": "You are ScreenAI, an assistant embedded in a desktop automation bot. You receive text captured from a specific region of the user's screen (via OCR), sometimes together with the screenshot of that region. Answer concisely and directly so the answer can be typed into a small on-screen field. Prefer plain text: no markdown, no code fences, no bullet lists unless asked. If the captured text is a question, answer it. If it is a statement or label, explain its meaning briefly. If it looks like a form field name, suggest what should be entered there. Never output more than {{MAX_CHARS}} characters.",
+    "user_template": "Screen region: {{REGION_NAME}}\nOCR confidence: {{CONFIDENCE}}%\n\nCaptured text:\n\"\"\"\n{{TEXT}}\n\"\"\"\n\nTask: {{TASK}}",
+    "tasks": {
+      "answer": "Answer the question contained in the captured text.",
+      "explain": "Explain the meaning of the captured text in one or two short sentences.",
+      "summarize": "Summarize the captured text in one short sentence.",
+      "translate": "Translate the captured text to {{TARGET_LANG}}, output only the translation.",
+      "suggest_input": "The captured text is a field label or prompt. Output ONLY the value that should be typed into that field, nothing else.",
+      "custom": "{{CUSTOM}}"
+    },
+    "target_lang": "English",
+    "custom_instruction": "Rewrite the captured text politely and professionally."
+  },
+  "output": {
+    "mode": "type",
+    "destination_region": null,
+    "clipboard_only": false,
+    "save_history": true,
+    "history_file": "history.jsonl"
+  }
+}
