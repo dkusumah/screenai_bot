@@ -24,7 +24,16 @@
     "pause_after_answer_ms": 350,
     "confirm_before_action": true,
     "focus_click": true,
-    "clear_field_shortcut": "ctrl+a"
+    "clear_field_shortcut": "ctrl+a",
+    "debug_pointer": false,
+    "debug_pointer_delay_ms": 120,
+    "auto_hide_window": true,
+    "auto_hide_delay_ms": 220,
+    "auto_hide_max_ms": 8000,
+    "auto_hide_capture_mode": "always",
+    "mcq_click_repeat": 2,
+    "mcq_click_gap_ms": 600,
+    "restore_delay_ms": 1000
   },
   "hotkeys": {
     "select_region": "ctrl+alt+r",
@@ -39,6 +48,7 @@
     "user_template": "Screen region: {{REGION_NAME}}\nOCR confidence: {{CONFIDENCE}}%\n\nCaptured text:\n\"\"\"\n{{TEXT}}\n\"\"\"\n\nTask: {{TASK}}",
     "tasks": {
       "answer": "Answer the question contained in the captured text.",
+      "choose_option": "The captured text contains a multiple-choice question and its options. Reply with ONLY the exact text of the single correct option, copied verbatim from the captured text. No letter, no quotes, no explanation.",
       "explain": "Explain the meaning of the captured text in one or two short sentences.",
       "summarize": "Summarize the captured text in one short sentence.",
       "translate": "Translate the captured text to {{TARGET_LANG}}, output only the translation.",
@@ -54,5 +64,10 @@
     "clipboard_only": false,
     "save_history": true,
     "history_file": "history.jsonl"
+  },
+  "ui": {
+    "show_log": true,
+    "show_options": false,
+    "show_ai": false
   }
 }

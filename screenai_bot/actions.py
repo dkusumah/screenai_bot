@@ -19,7 +19,7 @@ import logging
 import platform
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from .config import Config, Region
 
@@ -107,8 +107,11 @@ def screen_size() -> Tuple[int, int]:
 class InputController:
     """Thin, testable wrapper around pyautogui with our config defaults applied."""
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(
+        self, cfg: Config, on_pointer: Optional[Callable[[int, int, str], None]] = None
+    ) -> None:
         self.cfg = cfg
+        self._on_pointer = on_pointer
         pg = require_pyautogui()
         pg.FAILSAFE = bool(cfg.get_path("actions.failsafe", True))
         pg.PAUSE = 0.0
@@ -125,6 +128,20 @@ class InputController:
             x=x, y=y, clicks=clicks, button=button,
             interval=float(self.cfg.get_path("actions.click_duration", 0.06)),
         )
+        # The OS can clamp/misapply a position (scaled display, edge of screen,
+        # dead zone). Verify where the pointer really ended up so a "wrong spot"
+        # click is visible in the log instead of failing silently.
+        try:
+            actual = tuple(int(v) for v in self._pg.position())
+            if abs(actual[0] - int(x)) > 2 or abs(actual[1] - int(y)) > 2:
+                log.warning(
+                    "Pointer landed at %s instead of (%s,%s) - click went to the "
+                    "wrong place!", actual, int(x), int(y),
+                )
+            else:
+                log.info("click delivered at %s (button=%s, clicks=%s)", actual, button, clicks)
+        except Exception:  # pragma: no cover - position() unavailable
+            log.debug("could not read back the pointer position", exc_info=True)
         if duration:
             time.sleep(duration)
 
@@ -163,6 +180,20 @@ class InputController:
             self.hotkey("ctrl", "v")
         return True
 
+    def _notify_pointer(self, step: ActionStep) -> None:
+        """Debug aid: ask the UI to flash the click location before it happens."""
+        if self._on_pointer is None or not self.cfg.get_path("actions.debug_pointer", False):
+            return
+        try:
+            self._on_pointer(int(step.x), int(step.y), step.kind)
+        except Exception:
+            log.debug("pointer debug callback failed", exc_info=True)
+            return
+        # Give the GUI a moment to draw the ripple before the real click lands.
+        delay_ms = int(self.cfg.get_path("actions.debug_pointer_delay_ms", 120) or 0)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+
     # --------------------------------------------------------------------- steps
     def run_steps(self, steps: List[ActionStep], stop_flag: Optional[Any] = None) -> ActionResult:
         result = ActionResult(ok=True, steps=list(steps))
@@ -186,6 +217,7 @@ class InputController:
             clicks = 2 if step.kind == "double_click" else 1
             button = "right" if step.kind == "right_click" else step.button
             log.info("ACTION %s", step.describe())
+            self._notify_pointer(step)
             self.click(step.x, step.y, clicks=clicks, button=button)
             time.sleep(0.12)
         elif step.kind == "move":

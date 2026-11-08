@@ -10,6 +10,7 @@ Signals emitted (all safe to connect to Qt slots; the worker lives in a QThread)
 * ``action_preview(list)``       - list of step descriptions awaiting confirmation
 * ``action_done(object)``        - :class:`ActionResult`
 * ``failed(str)``                - user-facing error
+* ``action_pointer(int,int,str)``- click location relayed for the debug flash
 * ``finished()``                 - pipeline complete (success or not)
 """
 
@@ -73,6 +74,7 @@ class PipelineWorker(QObject):
     action_done = Signal(object)
     failed = Signal(str)
     finished = Signal()
+    action_pointer = Signal(int, int, str)  # debug: where a click will land
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
@@ -80,18 +82,30 @@ class PipelineWorker(QObject):
         self.capture = ScreenCapture()
         self.ocr = OcrEngine(cfg)
         self.ai = AIClient(cfg)
-        self.input = InputController(cfg)
+        self.input = InputController(cfg, on_pointer=self._emit_pointer)
         self.planner = ActionPlanner(cfg)
         self._stop = False
         self._request: Optional[PipelineRequest] = None
         self._last_answer: Optional[AiAnswer] = None
         self._last_ocr: Optional[OcrResult] = None
         self._pending_steps: List[Any] = []
+        # Optional callbacks supplied by the GUI so it can move its own window
+        # out of the way before capturing or sending input (occlusion handling).
+        self.pre_action_hook: Optional[Any] = None   # f(x, y, will_click) -> None
+        self.post_action_hook: Optional[Any] = None  # f() -> None
+        self.pre_capture_hook: Optional[Any] = None  # f(region) -> None
+        self.post_capture_hook: Optional[Any] = None  # f() -> None
+        # Returns the bot panel's global (left, top, width, height), if known.
+        self.panel_rect_provider: Optional[Any] = None
 
     # ------------------------------------------------------------------ controls
     def stop(self) -> None:
         self._stop = True
         self.status.emit("Stopping...")
+
+    def _emit_pointer(self, x: int, y: int, kind: str) -> None:
+        """Relay a click location to the GUI so it can flash it (debug aid)."""
+        self.action_pointer.emit(int(x), int(y), str(kind))
 
     @property
     def last_answer(self) -> Optional[AiAnswer]:
@@ -107,6 +121,7 @@ class PipelineWorker(QObject):
         self._stop = False
         self._request = request
         try:
+            self.log_line.emit("[1/9] Run started")
             image = self._stage_capture(request)
             ocr = self._stage_ocr(image, request)
             if ocr is None:
@@ -123,11 +138,27 @@ class PipelineWorker(QObject):
 
     def _stage_capture(self, request: PipelineRequest):
         self.status.emit(f"Capturing {request.source_region}...")
+        # STEP 2: hide the panel BEFORE grabbing, otherwise the screenshot (and
+        # therefore OCR and the matched click point) contains our own UI.
+        self.log_line.emit("[2/9] Hiding the panel while capturing")
+        if self.pre_capture_hook is not None:
+            try:
+                self.pre_capture_hook(request.source_region)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("pre_capture_hook failed: %s", exc)
         try:
             image = self.capture.grab(request.source_region)
         except Exception as exc:
             self.failed.emit(f"Screen capture failed: {exc}")
             return None
+        finally:
+            # STEP 3: bring the panel back right after the pixels are grabbed.
+            if self.post_capture_hook is not None:
+                try:
+                    self.post_capture_hook()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("post_capture_hook failed: %s", exc)
+            self.log_line.emit("[3/9] Panel shown again")
         self.captured.emit(image)
         self.log_line.emit(f"Captured {image.width}x{image.height}px from \"{request.source_region.name}\"")
         return image
@@ -196,6 +227,7 @@ class PipelineWorker(QObject):
             self.failed.emit("Stopped before AI request.")
             return None
         self.status.emit("Asking AI...")
+        self.log_line.emit(f"[4/9] Sending the question to the AI (task={request.task_key})")
         started = time.time()
         try:
             answer = self.ai.ask(
@@ -215,6 +247,7 @@ class PipelineWorker(QObject):
             answer.text = answer.text[:max_chars].rstrip() + "..."
         self.answer_ready.emit(answer)
         self._last_answer = answer
+        self.log_line.emit(f"[5/9] AI replied: {answer.one_liner()}")
         self.log_line.emit(
             f"AI ({answer.provider}/{answer.model}, {answer.latency_ms}ms): {answer.one_liner()}"
         )
@@ -222,6 +255,14 @@ class PipelineWorker(QObject):
         return answer
 
     def _stage_action(self, answer: AiAnswer, request: PipelineRequest, ocr: OcrResult) -> None:
+        self.log_line.emit(f"[action] mode={request.mode} task={request.task_key}")
+        if request.task_key == "choose_option" and request.mode != "click_matching_line":
+            self.log_line.emit(
+                "[warn] Task is 'choose_option' but the Action mode is "
+                f"'{request.mode}' - that mode clicks the region CENTER and types the "
+                "answer. Pick 'Click the line matching the AI answer (MCQ)' in the "
+                "Action dropdown to click the chosen option instead."
+            )
         if request.dry_run:
             self.status.emit("Dry run: no clicks/typing performed.")
             return
@@ -229,6 +270,10 @@ class PipelineWorker(QObject):
             ok = self.input.copy_to_clipboard(answer.text)
             self.status.emit("Answer copied to clipboard." if ok else "Clipboard unavailable.")
             self.action_done.emit(ActionResult(ok=ok, error="" if ok else "clipboard failed"))
+            return
+
+        if request.mode == "click_matching_line":
+            self._act_click_matching_line(answer, request, ocr)
             return
 
         target = request.target_region
@@ -261,6 +306,80 @@ class PipelineWorker(QObject):
             return
         self.execute_steps(steps)
 
+    def _act_click_matching_line(
+        self, answer: AiAnswer, request: PipelineRequest, ocr: OcrResult
+    ) -> None:
+        """MCQ mode: click the OCR line whose text matches the AI's chosen option."""
+        from .actions import ActionStep
+        from .ocr import clean_option_text, find_line_center
+
+        target_text = clean_option_text(answer.text)
+        region = request.source_region
+        # The captured OCR result normally carries word boxes; fall back to the
+        # last real run when this was triggered from manually-edited text.
+        word_source = ocr if (ocr and ocr.words) else self._last_ocr
+        if word_source is None or not word_source.words:
+            self.failed.emit(
+                "MCQ click mode needs OCR word positions. Run on the region once first."
+            )
+            return
+        if word_source is not ocr:
+            self.log_line.emit(
+                "[warn] No OCR boxes in this result - reusing the previous capture's "
+                "boxes. Coordinates may be stale; run the full pipeline instead."
+            )
+        match = find_line_center(
+            self.ocr.lines(word_source), target_text, region.left, region.top
+        )
+        if match is None:
+            snippet = target_text or answer.text
+            self.log_line.emit(f"[6/9] No OCR line matched: {snippet!r}")
+            self.failed.emit(f'Could not locate an option matching "{snippet}" on screen.')
+            return
+        gx, gy, matched_text = match
+        # Guard: a hit inside our own panel means the capture contained our UI, so
+        # the coordinates describe a place in the bot window, not the option.
+        panel = self.panel_rect_provider() if self.panel_rect_provider is not None else None
+        if panel is not None:
+            left, top, width, height = panel
+            if left <= gx < left + width and top <= gy < top + height:
+                self.log_line.emit(
+                    f"[6/9] Matched \"{matched_text}\" at ({gx},{gy}) - INSIDE the bot "
+                    "panel, so the capture included our own window."
+                )
+                self.failed.emit(
+                    "Refusing to click: the answer matched text inside the bot window. "
+                    "Enable 'Hide while acting' and keep the panel off the read area."
+                )
+                return
+        self.log_line.emit(f"[6/9] Answer found on screen: \"{matched_text}\" -> ({gx},{gy})")
+        if not (region.left <= gx < region.right and region.top <= gy < region.bottom):
+            self.log_line.emit(
+                f"[warn] Click point ({gx},{gy}) is outside the read area "
+                f"[{region.left},{region.top} {region.width}x{region.height}] - "
+                "check display scaling / stale OCR boxes."
+            )
+        self.log_line.emit(f'[option] Matched "{matched_text}" -> click ({gx},{gy})')
+        repeat = max(1, int(self.cfg.get_path("actions.mcq_click_repeat", 2) or 1))
+        gap_ms = max(0, int(self.cfg.get_path("actions.mcq_click_gap_ms", 600) or 0))
+        steps: List[Any] = []
+        for index in range(repeat):
+            if index:
+                # A real pause keeps the OS from merging the clicks into one
+                # double-click, which is what "two single left clicks" means.
+                steps.append(ActionStep(kind="wait", text=f"{gap_ms / 1000.0:.2f}s"))
+            steps.append(ActionStep(kind="click", x=int(gx), y=int(gy)))
+        self.log_line.emit(
+            f"[option] Sending {repeat} separate left click(s), {gap_ms}ms apart"
+        )
+        needs_confirm = bool(self.cfg.get_path("actions.confirm_before_action", True))
+        if needs_confirm:
+            self._pending_steps = steps
+            self.action_preview.emit([step.describe() for step in steps])
+            self.status.emit("Waiting for confirmation of the option click...")
+            return
+        self.execute_steps(steps)
+
     def execute_steps(self, steps: Optional[List[Any]] = None) -> None:
         steps = steps if steps is not None else self._pending_steps
         self._pending_steps = []
@@ -270,12 +389,59 @@ class PipelineWorker(QObject):
         if pause_ms:
             time.sleep(pause_ms / 1000.0)
         self.status.emit(f"Performing {len(steps)} action(s)...")
-        result = self.input.run_steps(steps, stop_flag=_FlagView(self, "_stop"))
+        # Let the GUI move its own window out of the way first: if the click
+        # point sits under the bot window, the click would land on the bot
+        # instead of the application underneath.
+        will_click = any(
+            getattr(step, "kind", "") in ("click", "double_click", "right_click")
+            for step in steps
+        )
+        point = self._first_input_point(steps)
+        self.log_line.emit("[7/9] Hiding the panel for the click")
+        hidden = False
+        try:
+            if self.pre_action_hook is not None:
+                hidden = bool(self.pre_action_hook(point[0], point[1], will_click))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("pre_action_hook failed: %s", exc)
+        self.log_line.emit(f"[8/9] Clicking ({point[0]},{point[1]})")
+        try:
+            result = self.input.run_steps(steps, stop_flag=_FlagView(self, "_stop"))
+        finally:
+            # Only wait when we actually hid the panel: this gives the target
+            # application time to finish reacting before our window reappears.
+            delay_ms = 0
+            if hidden:
+                delay_ms = max(0, int(self.cfg.get_path("actions.restore_delay_ms", 1000) or 0))
+            if delay_ms:
+                self.log_line.emit(f"[9/9] Waiting {delay_ms}ms before showing the panel")
+                time.sleep(delay_ms / 1000.0)
+            if self.post_action_hook is not None:
+                try:
+                    self.post_action_hook()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("post_action_hook failed: %s", exc)
+            self.log_line.emit("[9/9] Panel shown again")
         self.action_done.emit(result)
         if result.ok:
             self.log_line.emit(f"Actions completed ({result.executed} steps).")
         else:
             self.failed.emit(result.error or "Action failed.")
+
+    @staticmethod
+    def _first_input_point(steps: List[Any]) -> tuple:
+        """Return the (x, y) the action will touch first, for occlusion checks."""
+        for step in steps:
+            if getattr(step, "kind", "") == "wait":
+                continue  # wait steps carry no coordinates
+            x = getattr(step, "x", None)
+            y = getattr(step, "y", None)
+            if x is not None and y is not None:
+                return int(x), int(y)
+        try:
+            return pointer_position()
+        except Exception:  # pragma: no cover - headless
+            return 0, 0
 
     def paste_last_answer_at_cursor(self) -> None:
         if self._last_answer is None:

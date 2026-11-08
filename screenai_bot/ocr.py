@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import shutil
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config, Region
 
@@ -205,6 +206,79 @@ class OcrEngine:
             if not placed:
                 rows.append([word])
         return rows
+
+
+def normalize_match_text(text: str) -> str:
+    """Lowercase and strip punctuation/quotes so OCR lines compare loosely."""
+    value = str(text or "").lower()
+    value = value.replace("\u2019", "'").replace("\u2018", "'")
+    value = value.replace("\u201c", '"').replace("\u201d", '"')
+    value = re.sub(r"[^0-9a-z\s]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def clean_option_text(text: str) -> str:
+    """Trim an AI answer down to a bare option phrase (drops labels/quotes)."""
+    value = str(text or "").strip().strip('"').strip("'").strip()
+    # drop a leading "Answer:" / "The correct option is" style label
+    value = re.sub(
+        r"^(?:the\s+)?(?:correct\s+)?(?:answer|option|choice)\s*(?:is|:)?\s*",
+        "", value, flags=re.IGNORECASE,
+    )
+    value = value.strip().strip('"').strip("'").strip()
+    # drop a leading option marker like "B) ", "(B) ", "B. " or "B: "
+    value = re.sub(r"^[\(\[]?[A-Za-z][\)\].:\-]\s+", "", value).strip()
+    return value
+
+
+def _line_match_score(target_norm: str, line_norm: str) -> float:
+    if not target_norm or not line_norm:
+        return 0.0
+    if target_norm == line_norm:
+        return 100.0
+    if target_norm in line_norm or line_norm in target_norm:
+        return 80.0
+    target_tokens = set(target_norm.split())
+    line_tokens = set(line_norm.split())
+    if not target_tokens:
+        return 0.0
+    overlap = len(target_tokens & line_tokens) / len(target_tokens)
+    return 50.0 * overlap if overlap >= 0.6 else 0.0
+
+
+def find_line_center(
+    lines: List[List["OcrWord"]], target: str, region_left: int = 0, region_top: int = 0
+) -> Optional[Tuple[int, int, str]]:
+    """Locate the OCR line best matching ``target`` and return its global center.
+
+    ``lines`` comes from :meth:`OcrEngine.lines`. Coordinates in ``lines`` are
+    region-local, so ``region_left``/``region_top`` convert them to the global
+    (virtual-desktop) space used for clicking. Returns ``(x, y, matched_text)``
+    or ``None`` when nothing scores above zero.
+    """
+    norm_target = normalize_match_text(target)
+    if not norm_target:
+        return None
+    best: Optional[Tuple[float, List["OcrWord"], str]] = None
+    for line in lines:
+        words = [w for w in line if w.text.strip()]
+        if not words:
+            continue
+        words.sort(key=lambda w: w.left)
+        line_text = " ".join(w.text for w in words)
+        score = _line_match_score(norm_target, normalize_match_text(line_text))
+        if score > 0 and (best is None or score > best[0]):
+            best = (score, words, line_text)
+    if best is None:
+        return None
+    _, words, line_text = best
+    left = min(w.left for w in words)
+    top = min(w.top for w in words)
+    right = max(w.left + w.width for w in words)
+    bottom = max(w.top + w.height for w in words)
+    cx = int(region_left + (left + right) / 2)
+    cy = int(region_top + (top + bottom) / 2)
+    return cx, cy, line_text
 
 
 def image_to_base64_png(image: "Image.Image", max_side: int = 1600) -> str:

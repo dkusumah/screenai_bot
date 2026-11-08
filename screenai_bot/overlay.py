@@ -1,19 +1,22 @@
 """Frameless, click-through-ish overlays drawn on top of everything.
 
-Two widgets live here:
+Three widgets live here:
 
 * :class:`RegionSelector` - drag-a-box overlay used to define a screen area
   (multi-monitor aware; supports arrow-key nudging and Esc to cancel).
 * :class:`RegionMarker`   - persistent thin outline that shows where the saved
   regions currently are, so you can see what the bot will read.
+* :class:`ClickFlash`     - short-lived ripple that flashes where the bot clicks
+  (debug aid for the ``actions.debug_pointer`` setting).
 """
 
 from __future__ import annotations
 
+import time
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .config import Region
@@ -127,10 +130,16 @@ class RegionSelector(QWidget):
         self._draw_hud(painter, rect)
 
     def _draw_hud(self, painter: QPainter, rect: QRect) -> None:
-        painter.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        title_font = painter.font()
+        title_font.setPointSize(13)
+        title_font.setBold(True)
+        painter.setFont(title_font)
         painter.setPen(QColor(240, 240, 240))
         painter.drawText(self.rect().adjusted(0, 40, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self._title)
-        painter.setFont(QFont("Segoe UI", 10))
+        hint_font = painter.font()
+        hint_font.setPointSize(10)
+        hint_font.setBold(False)
+        painter.setFont(hint_font)
         painter.setPen(QColor(200, 200, 200))
         painter.drawText(self.rect().adjusted(0, 70, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self._hint)
         if rect and rect.width() > 4:
@@ -204,8 +213,82 @@ class RegionMarker(QWidget):
             if active:
                 painter.fillRect(rect, QColor(80, 200, 255, 24))
             painter.setPen(color)
-            painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            label_font = painter.font()
+            label_font.setPointSize(8)
+            label_font.setBold(True)
+            painter.setFont(label_font)
             painter.drawText(rect.adjusted(4, 2, 0, 0), Qt.AlignLeft | Qt.AlignTop, name)
+
+
+class ClickFlash(QWidget):
+    """Transient overlay that flashes a ripple where the bot clicks (debug aid)."""
+
+    DURATION = 0.65  # seconds a ripple stays visible
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setGeometry(_virtual_desktop_geometry())
+        self._point: Optional[Tuple[int, int, str]] = None
+        self._started = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)  # ~60 fps
+        self._timer.timeout.connect(self._tick)
+
+    def flash(self, x: int, y: int, label: str = "") -> None:
+        """Show a click marker at global coordinates ``(x, y)``."""
+        self._point = (int(x), int(y), str(label or ""))
+        self._started = time.monotonic()
+        self.setGeometry(_virtual_desktop_geometry())
+        self.show()
+        self.raise_()
+        self._timer.start()
+        self.update()
+
+    def _tick(self) -> None:
+        if self._point is None or time.monotonic() - self._started >= self.DURATION:
+            self._timer.stop()
+            self._point = None
+            self.hide()
+            return
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if self._point is None:
+            return
+        x, y, label = self._point
+        offset = _virtual_desktop_geometry().topLeft()
+        cx, cy = x - offset.x(), y - offset.y()
+        progress = min(1.0, (time.monotonic() - self._started) / self.DURATION)
+        alpha = int(255 * (1.0 - progress))
+        radius = int(10 + 42 * progress)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # expanding ring
+        painter.setPen(QPen(QColor(255, 90, 60, alpha), 3))
+        painter.drawEllipse(QPoint(cx, cy), radius, radius)
+        # crosshair
+        painter.setPen(QPen(QColor(255, 255, 255, alpha), 1))
+        painter.drawLine(cx - 12, cy, cx + 12, cy)
+        painter.drawLine(cx, cy - 12, cx, cy + 12)
+        # centre dot
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 90, 60, alpha))
+        painter.drawEllipse(QPoint(cx, cy), 3, 3)
+        # coordinate/kind label
+        if label:
+            painter.setPen(QColor(255, 255, 255, alpha))
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(8)
+            painter.setFont(font)
+            painter.drawText(cx + 14, cy - 12, f"{label} ({x},{y})")
 
 
 def _virtual_desktop_geometry() -> QRect:

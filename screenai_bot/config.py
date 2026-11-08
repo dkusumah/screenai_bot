@@ -47,6 +47,36 @@ DEFAULTS: Dict[str, Any] = {
         "confirm_before_action": True,
         "focus_click": True,
         "clear_field_shortcut": "ctrl+a",
+        "debug_pointer": False,
+        "debug_pointer_delay_ms": 120,
+        # Hide the bot window while input events fire, so a click that lands
+        # under our own window reaches the app underneath instead.
+        "auto_hide_window": True,
+        "auto_hide_delay_ms": 220,
+        "auto_hide_max_ms": 8000,
+        # "always" hides the panel for every capture (recommended: it keeps our
+        # own UI out of the screenshot). "overlap" only hides when the read area
+        # intersects the panel.
+        "auto_hide_capture_mode": "always",
+        # MCQ action: how many separate left clicks to send on the answer, and
+        # the pause between them. The gap must stay above the OS double-click
+        # interval (~0.5s on macOS) or the two clicks merge into a double-click.
+        "mcq_click_repeat": 2,
+        "mcq_click_gap_ms": 600,
+        # Keep the panel hidden this long after the last input event so the
+        # target app can finish reacting (page transition, checkbox repaint)
+        # before our window pops back on top.
+        "restore_delay_ms": 1000,
+    },
+    # Last GUI selections, persisted so restarting the app does not silently
+    # fall back to the default "type_in_region" action (which clicks the
+    # region center instead of the chosen MCQ line).
+    "ui": {
+        "action_mode": "type_in_region",
+        "task_key": "answer",
+        "show_log": True,
+        "show_options": False,
+        "show_ai": False,
     },
     "hotkeys": {
         "select_region": "ctrl+alt+r",
@@ -63,7 +93,14 @@ DEFAULTS: Dict[str, Any] = {
             "reply can be typed into a small on-screen field."
         ),
         "user_template": 'Captured text:\n"""\n{{TEXT}}\n"""\n\nTask: {{TASK}}',
-        "tasks": {"answer": "Answer the question in the captured text."},
+        "tasks": {
+            "answer": "Answer the question in the captured text.",
+            "choose_option": (
+                "The captured text contains a multiple-choice question and its options. "
+                "Reply with ONLY the exact text of the single correct option, copied "
+                "verbatim from the captured text. No letter, no quotes, no explanation."
+            ),
+        },
         "target_lang": "English",
         "custom_instruction": "Explain the captured text.",
     },
