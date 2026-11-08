@@ -165,7 +165,12 @@ class LocalHotkeyFallback:
         self.parent = parent_window
 
     def bind(self, combo: str, slot: Callable[[], None]) -> None:
-        from PySide6.QtWidgets import QShortcut
+        # QShortcut is part of QtGui in Qt 6; fall back to QtWidgets for
+        # legacy PySide6 releases that re-exported it there.
+        try:
+            from PySide6.QtGui import QShortcut
+        except ImportError:  # pragma: no cover
+            from PySide6.QtWidgets import QShortcut
         from PySide6.QtGui import QKeySequence
 
         shortcut = QShortcut(QKeySequence(_qt_sequence(combo)), self.parent)
