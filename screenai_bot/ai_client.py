@@ -2,7 +2,7 @@
 
 Speaks plain REST with ``requests`` so it works against any OpenAI-compatible
 endpoint (OpenAI, Azure-style gateways, Ollama, LM Studio, vLLM, OpenRouter,
-Groq, ...) and Anthropic, without vendor SDKs.
+Groq, ...), Anthropic, and Google Gemini, without vendor SDKs.
 """
 
 from __future__ import annotations
@@ -125,6 +125,8 @@ class AIClient:
 
         if self.provider == "anthropic":
             answer = self._ask_anthropic(api_key, system, user, ocr, image, use_vision)
+        elif self.provider == "gemini":
+            answer = self._ask_gemini(api_key, system, user, image, use_vision)
         else:
             answer = self._ask_openai_compat(api_key, system, user, ocr, image, use_vision)
         if on_progress:
@@ -166,6 +168,63 @@ class AIClient:
             provider=self.provider,
             prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
             completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+            raw=data,
+        )
+
+    # ------------------------------------------------------------------- gemini
+    def _ask_gemini(
+        self, api_key: str, system: str, user: str, image: Any, vision: bool
+    ) -> AiAnswer:
+        """Call the native Gemini ``generateContent`` endpoint.
+
+        Uses the ``x-goog-api-key`` header because recent authorisation keys
+        (``AQ.`` prefix) are rejected on the OpenAI-compatible route when sent
+        as ``Authorization: Bearer``.
+        """
+        parts: List[Dict[str, Any]] = []
+        if vision:
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": image_to_base64_png(image),
+                    }
+                }
+            )
+        parts.append({"text": user})
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": float(self.cfg.get_path("ai.temperature", 0.2)),
+                "maxOutputTokens": int(self.cfg.get_path("ai.max_tokens", 800)),
+            },
+        }
+        model = str(self.cfg.get_path("ai.model", "gemini-3.8-flash"))
+        url = f"{self._base_url()}/models/{model}:generateContent"
+        data = self._post(
+            url,
+            {"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            body,
+        )
+        try:
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise AIError(f"Gemini returned no candidates: {json.dumps(data)[:300]}")
+            finish = candidates[0].get("finishReason", "")
+            parts_out = candidates[0].get("content", {}).get("parts", [])
+        except (AttributeError, TypeError) as exc:
+            raise AIError(f"Unexpected Gemini response shape: {json.dumps(data)[:400]}") from exc
+        if finish not in ("STOP", "MAX_TOKENS", ""):
+            raise AIError(f"Gemini stopped with finishReason={finish!r}")
+        text = "".join(str(part.get("text", "")) for part in parts_out)
+        usage = data.get("usageMetadata") or {}
+        return AiAnswer(
+            text=_tidy(text),
+            model=data.get("modelVersion", model),
+            provider="gemini",
+            prompt_tokens=int(usage.get("promptTokenCount", 0) or 0),
+            completion_tokens=int(usage.get("candidatesTokenCount", 0) or 0),
             raw=data,
         )
 
