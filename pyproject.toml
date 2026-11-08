@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "screenai-bot"
+version = "1.0.0"
+description = "Desktop bot: OCR a screen region, ask an AI API, then click/type the answer back into a screen area."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "PySide6>=6.6",
+    "mss>=9.0.2",
+    "Pillow>=10.2.0",
+    "pytesseract>=0.3.10",
+    "pynput>=1.7.6",
+    "pyautogui>=0.9.54",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+vision = ["openai>=1.30.0"]
+
+[project.scripts]
+screenai-bot = "screenai_bot:run_gui"
+screenai-bot-cli = "screenai_bot.cli:main"
+
+[tool.setuptools]
+packages = ["screenai_bot"]
+
+[tool.setuptools.package-data]
+screenai_bot = ["config.json"]
