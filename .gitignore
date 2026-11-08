@@ -4,3 +4,6 @@ build/
 dist/
 *.egg-info/
 .screenai_bot_test/
+
+# OS / editor noise
+.DS_Store

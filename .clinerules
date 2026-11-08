@@ -1,0 +1,47 @@
+# Cline Rules — screenai_bot
+
+## Project Overview
+ScreenAI Bot is a desktop automation tool that:
+1. Captures a user-selected screen region (mss) and extracts text (Tesseract OCR, optional vision LLM).
+2. Sends the extracted text to an AI API (OpenAI-compatible chat completions or Anthropic messages).
+3. Receives the answer/meaning and performs clicks or typing inside the target screen area
+   (pyautogui-based actions, clipboard paste fallback for Unicode, failsafe stop).
+
+Entry points:
+- GUI:        python -m screenai_bot          (PySide6 control panel + region overlay)
+- Headless:   python -m screenai_bot.cli      (CLI pipeline, --help for flags)
+
+## Environment & Setup
+- Python >= 3.10 (user's machine uses a recent PySide6; keep code Qt6-compatible).
+- Install deps: pip install -r requirements.txt
+- Requires Tesseract binary on PATH for OCR; macOS needs Accessibility + Screen Recording permissions.
+- API keys come from env vars: OPENAI_API_KEY, ANTHROPIC_API_KEY. Never hardcode secrets.
+
+## Code Style
+- Follow PEP 8; type hints on public functions; docstrings for modules and public APIs.
+- Keep modules small and focused: capture, ocr, ai_client, actions, pipeline, ui, overlay, hotkeys, config, cli.
+- Prefer explicit errors over silent failures; every external call (API, OCR, GUI action) must handle exceptions.
+- No new heavy dependencies without updating requirements.txt AND pyproject.toml.
+
+## Qt / PySide6 Rules (important)
+- QAction and QShortcut MUST be imported from PySide6.QtGui (canonical location in Qt6),
+  NOT from PySide6.QtWidgets. Use try/except fallback to QtWidgets only for legacy PySide6 < 6.4.
+- All other widgets (QPushButton, QLabel, QVBoxLayout, ...) belong in PySide6.QtWidgets.
+
+## Editing Rules
+- Verify file existence and content before editing; never assume prior steps succeeded.
+- After any edit, run: python -m py_compile <changed files> and import-check affected modules.
+- For GUI changes, confirm imports resolve with the installed PySide6 version.
+- Keep commits atomic with clear imperative messages (e.g., "Fix QAction/QShortcut imports").
+- Never force-push to main. Push only after verifying `git status` and `git log origin/main..main`.
+- Do not commit: .env, tokens, API keys, __pycache__, venv/, *.egg-info, build artifacts.
+
+## Testing / Verification
+- CLI smoke test: python -m screenai_bot.cli --help must exit 0.
+- Pipeline logic should be testable against a mock HTTP server (no real API calls in tests).
+- Manual GUI test on macOS: python -m screenai_bot opens the control panel without ImportError.
+
+## Security
+- Never print or log API keys/tokens. Mask them in any diagnostics.
+- The GitHub PAT used for pushing must have "Contents: Read and write" on this repo;
+  if a push returns 403, report it honestly instead of claiming success.
