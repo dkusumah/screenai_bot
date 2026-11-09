@@ -19,8 +19,8 @@ import time
 from typing import List, Optional
 
 from PySide6.QtCore import (
-    Q_ARG, QMetaObject, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer,
-    Signal, Slot,
+    Q_ARG, QEvent, QMetaObject, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread,
+    QTimer, Signal, Slot,
 )
 from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPainter, QPen, QPixmap
 # QAction and QShortcut live in QtGui since Qt 6 (they are NOT widgets), but
@@ -32,17 +32,28 @@ except ImportError:  # pragma: no cover - legacy PySide6 (< ~6.4)
     from PySide6.QtWidgets import QAction, QShortcut
 
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSizePolicy, QStatusBar, QTabWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QPushButton, QSizePolicy, QSpinBox, QStatusBar, QTabWidget, QTextEdit,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from .actions import ActionPlanner
-from .config import APP_DIR, BUNDLED_CONFIG, DEFAULTS, Config, Region, deep_merge, load_config
+from .config import (
+    APP_DIR, BUNDLED_CONFIG, DEFAULT_HALLUCINATION_LEVEL, DEFAULT_MAX_ANSWER_WORDS,
+    DEFAULT_MIN_ANSWER_WORDS, DEFAULTS, FORMAT_FEATURES, HALLUCINATION_LEVELS,
+    MAX_ANSWER_WORDS_LIMIT, Config, Region, deep_merge, load_config,
+)
+from .native import (
+    IS_MACOS, hotkey_permission_hint, open_privacy_pane, permission_report,
+    request_permissions, set_dock_icon_visible,
+)
 from .ocr import OcrResult
 from .overlay import ClickFlash, RegionMarker, RegionSelector
 from .pipeline import PipelineRequest, PipelineWorker, preview_prompt
+from .sound import CUES as SOUND_CUES
+from .sound import SoundPlayer
 
 log = logging.getLogger("screenai.ui")
 
@@ -51,6 +62,20 @@ log = logging.getLogger("screenai.ui")
 # allowed inside f-string expressions).
 _ARROW_OPEN = "\u25be"
 _ARROW_CLOSED = "\u25b8"
+
+# Friendly labels/tooltips for the answer-format checkboxes (see FORMAT_FEATURES).
+FORMAT_LABELS = {
+    "markdown": "Markdown",
+    "html": "HTML",
+    "code": "Code",
+    "bullet_lists": "Bullet Lists",
+}
+FORMAT_TOOLTIPS = {
+    "markdown": "Let the answer use Markdown: **bold**, headings, `code` spans.",
+    "html": "Let the answer use HTML tags such as <b>, <br> or <ul>.",
+    "code": "Let the answer use fenced code blocks for code and commands.",
+    "bullet_lists": "Let the answer use bullet or numbered lists.",
+}
 
 
 class ChevronComboBox(QComboBox):
@@ -187,9 +212,132 @@ PROVIDER_DEFAULTS = {
 }
 
 
+class HotkeyTestDialog(QDialog):
+    """Live proof of whether the OS actually delivers key presses to the bot.
+
+    macOS silently blocks global hotkeys until the launching app has *Input
+    Monitoring* (and *Accessibility*) permission. This dialog counts the key
+    events that really arrived and links straight to the right settings pane, so
+    "the hotkeys do nothing" becomes diagnosable instead of mysterious.
+    """
+
+    def __init__(self, manager, parent: Optional[QWidget] = None,
+                 combos: Optional[dict] = None) -> None:
+        super().__init__(parent)
+        self.manager = manager
+        self.combos = dict(combos or {})
+        self.setWindowTitle("Test Hotkeys")
+        self.setMinimumWidth(620)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "Press one of your hotkeys now - the panel does not need focus.\n"
+            "The counters update live, so you can see whether the key press reached the bot."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        if self.combos:
+            from .hotkeys import describe_combo
+
+            legend = QLabel(
+                ("\u2303 = Control     \u2325 = Option (this is the Mac's Alt)     "
+                 "\u21e7 = Shift     \u2318 = Command\n"
+                 "So Ctrl+Alt+Enter means: hold Control + Option, then press Return - "
+                 "NOT Command.") if IS_MACOS else
+                "Ctrl and Alt are the Control and Alt keys; Command/Meta is a separate "
+                "modifier."
+            )
+            legend.setWordWrap(True)
+            legend.setStyleSheet("color: #a8bbd4;")
+            layout.addWidget(legend)
+            lines = "\n".join(
+                f"  {name.replace('_', ' '):<16} {describe_combo(combo)}"
+                for name, combo in self.combos.items() if combo
+            )
+            bindings = QLabel(f"Bound shortcuts:\n{lines}")
+            bindings.setStyleSheet("font-family: Menlo, Consolas, monospace;")
+            layout.addWidget(bindings)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            "font-family: Menlo, Consolas, monospace; background: #0d1117; "
+            "border: 1px solid #262f3d; border-radius: 8px; padding: 8px;"
+        )
+        layout.addWidget(self.status_label)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
+        self.permissions_label = QLabel(f"Permissions: {permission_report()}")
+        self.permissions_label.setWordWrap(True)
+        layout.addWidget(self.permissions_label)
+
+        buttons = QHBoxLayout()
+        for text, kind in (("Accessibility", "accessibility"),
+                           ("Input Monitoring", "input_monitoring")):
+            button = QPushButton(text)
+            button.setEnabled(IS_MACOS)
+            button.setToolTip(f"Open System Settings > Privacy & Security > {text}.")
+            button.clicked.connect(lambda _checked=False, k=kind: open_privacy_pane(k))
+            buttons.addWidget(button)
+        ask = QPushButton("Ask macOS")
+        ask.setEnabled(IS_MACOS)
+        ask.setToolTip("Trigger the macOS permission prompt.")
+        ask.clicked.connect(request_permissions)
+        buttons.addWidget(ask)
+        restart = QPushButton("Restart Hotkeys")
+        restart.setToolTip("Rebuild the key listener (the OS can disable it silently).")
+        restart.clicked.connect(self._restart)
+        buttons.addWidget(restart)
+        buttons.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(250)
+        self.refresh()
+
+    def _restart(self) -> None:
+        try:
+            self.manager.restart("requested from the test dialog", manual=True)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.status_label.setText(
+            f"{self.manager.activity_text()} | restarts: {getattr(self.manager, 'restart_count', 0)}"
+        )
+        blocked = self.manager.blocked_hint() if hasattr(self.manager, "blocked_hint") else ""
+        hint = hotkey_permission_hint()
+        if hint:
+            self.hint_label.setText(f"Blocked: {hint}")
+            self.hint_label.setStyleSheet("color: #ffb3c0;")
+        elif blocked:
+            self.hint_label.setText(f"Blocked: {blocked}")
+            self.hint_label.setStyleSheet("color: #ffb3c0;")
+        elif self.manager.receiving_events:
+            self.hint_label.setText("Key events are arriving - the hotkeys work.")
+            self.hint_label.setStyleSheet("color: #9ae6b4;")
+        else:
+            self.hint_label.setText(
+                "No key press received yet. Try another key, then check the permission "
+                "line below (or press 'Restart Hotkeys')."
+            )
+            self.hint_label.setStyleSheet("color: #f0c674;")
+        self.permissions_label.setText(f"Permissions: {permission_report()}")
+
 class MainWindow(QMainWindow):
     THEME = """
     QMainWindow, QDialog { background: #101419; }
+
     QWidget { color: #dbe4f0; font-size: 13px; }
     QLabel#appTitle { font-size: 21px; font-weight: 700; color: #f4f8ff; }
     QLabel#appHint { color: #8492a6; }
@@ -238,14 +386,19 @@ class MainWindow(QMainWindow):
     }
     QPushButton#danger:hover { background: #4a2029; border-color: #a03848; }
     QPushButton#danger:disabled { background: #1d171a; border-color: #33242a; color: #6f565e; }
-    QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QListWidget {
+    QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QListWidget, QSpinBox {
         background: #0d1117; border: 1px solid #262f3d; border-radius: 8px;
         padding: 6px 8px; selection-background-color: #2563eb; selection-color: #ffffff;
     }
-    QComboBox:hover, QLineEdit:hover { border-color: #334051; }
-    QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {
+    QComboBox:hover, QLineEdit:hover, QSpinBox:hover { border-color: #334051; }
+    QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus,
+    QSpinBox:focus {
         border-color: #3b82f6;
     }
+    QSpinBox::up-button, QSpinBox::down-button {
+        background: #1d2531; border: 1px solid #2b3646; border-radius: 4px; width: 15px;
+    }
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #26303f; }
     QComboBox QAbstractItemView {
         background: #12171f; border: 1px solid #2b3646; selection-background-color: #2563eb;
     }
@@ -283,7 +436,7 @@ class MainWindow(QMainWindow):
         "copy_only": "Copy Answer To Clipboard Only",
     }
 
-    def __init__(self, cfg: Optional[Config] = None) -> None:
+    def __init__(self, cfg: Optional[Config] = None, start_hidden: bool = False) -> None:
         super().__init__()
         self.cfg = cfg or load_config()
         self.setWindowTitle("ScreenAI Bot - read screen, ask AI, act")
@@ -293,6 +446,20 @@ class MainWindow(QMainWindow):
         self._hide_gen = 0
         self._hide_event: Optional[threading.Event] = None
         self._capture_panel_rect: Optional[tuple] = None
+        # --- background / tray state ---------------------------------------
+        self.start_hidden = bool(start_hidden)
+        self._quitting = False
+        self._tray_hidden = False
+        self._close_hint_shown = False
+        self.tray = None
+        # --- hotkey plumbing (filled by _register_hotkeys) ------------------
+        self._hotkey_actions: dict = {}
+        self._hotkey_combos: dict = {}
+        self._hotkey_fired_at: dict = {}
+        self._local_shortcuts: List[QShortcut] = []
+        # --- audible debug feedback ("did the hotkey/click happen?") --------
+        self.sounds = SoundPlayer(self.cfg)
+        self._last_miss_sound = 0.0
         # Let the worker ask us to move our own window out of the way before it
         # captures the screen or sends input (otherwise the screenshot and the
         # click both hit the bot window instead of the app underneath).
@@ -314,7 +481,26 @@ class MainWindow(QMainWindow):
         self._connect_worker()
         self._register_hotkeys()
         self._refresh_regions()
+        self._setup_tray()
+        # A dead event tap (macOS disables them silently) would otherwise mean
+        # "hotkeys stopped working until I restart the app".
+        self._hotkey_timer = QTimer(self)
+        self._hotkey_timer.timeout.connect(self._hotkey_watchdog)
+        self._hotkey_timer.start(3000)
         QTimer.singleShot(400, self._health_check)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        """Forget held keys when the app is (de)activated.
+
+        Switching to another app regularly loses key-release events, which used
+        to leave modifiers stuck and swallow every later shortcut.
+        """
+        try:
+            if event.type() == QEvent.ActivationChange and self.hotkeys is not None:
+                self.hotkeys.reset_state()
+        except Exception:  # pragma: no cover - defensive
+            log.debug("ActivationChange reset failed", exc_info=True)
+        super().changeEvent(event)
 
     # ------------------------------------------------------------------- UI build
     def _build_ui(self) -> None:
@@ -377,9 +563,9 @@ class MainWindow(QMainWindow):
         root.addLayout(controls)
 
         # --- collapsible Options: every behaviour switch lives here ----------
+        self.options_body = self._build_options_body()
         root.addWidget(
-            self._make_section("Options", self._build_options_body(),
-                               "ui.show_options", False)
+            self._make_section("Options", self.options_body, "ui.show_options", False)
         )
 
         # --- collapsible AI settings (expanded if no key is configured yet) ---
@@ -501,9 +687,12 @@ class MainWindow(QMainWindow):
         status.setSizeGripEnabled(False)
         self.setStatusBar(status)
         hotkeys = self.cfg.get_path("hotkeys", {}) or {}
+        from .hotkeys import describe_combo
+
         status.showMessage(
-            f"Run: {hotkeys.get('run')}    \u2022    Stop: {hotkeys.get('stop')}    \u2022    "
-            f"Select area: {hotkeys.get('select_region')}    \u2022    "
+            f"Run: {describe_combo(hotkeys.get('run', ''))}    \u2022    "
+            f"Stop: {describe_combo(hotkeys.get('stop', ''))}    \u2022    "
+            f"Select area: {describe_combo(hotkeys.get('select_region', ''))}    \u2022    "
             "Failsafe: slam the mouse into the top-left corner"
         )
         self.setCentralWidget(central)
@@ -576,7 +765,9 @@ class MainWindow(QMainWindow):
         separator()
         nav_button("Open Config", lambda: open_path(APP_DIR),
                    tooltip="Open the folder that holds config.json.")
-        nav_button("Quit", self.close)
+        nav_button("Quit", self.quit_app,
+                   tooltip="Stop the bot completely (closing the window keeps it running "
+                           "in the menu bar).")
         return bar
 
     def _build_options_body(self) -> QWidget:
@@ -621,12 +812,173 @@ class MainWindow(QMainWindow):
         for index, box in enumerate(boxes):
             grid.addWidget(box, index // 3, index % 3)
 
-        grid.addWidget(QLabel("Extra Context"), 2, 0)
+        # --- stay hidden for the whole write action --------------------------
+        self.hold_hidden_check = QCheckBox("Keep Hidden Until Typing Ends")
+        self.hold_hidden_check.setToolTip(
+            "For the 'answer' task with 'Click Inside Area, Clear It, Type Answer'\n"
+            "or 'Click Target Once, Then Type': hide this window from the first\n"
+            "click until the whole answer has been typed, then show it again."
+        )
+        self.hold_hidden_check.setChecked(
+            bool(self.cfg.get_path("actions.hide_until_writing_done", True))
+        )
+        self.hold_hidden_check.toggled.connect(self._on_hold_hidden_toggled)
+        grid.addWidget(self.hold_hidden_check, 2, 0, 1, 3)
+
+        # --- answer shaping: how long, how grounded, how human ---------------
+        self.human_check = QCheckBox("Answer Like A Human")
+        self.human_check.setToolTip(
+            "Make the reply read like a person typing in a chat box: everyday wording,\n"
+            "no 'The answer is' preamble, never restating the question."
+        )
+        self.human_check.setChecked(bool(self.cfg.get_path("ai.natural_answers", False)))
+        self.human_check.toggled.connect(self._on_human_toggled)
+
+        length_row = QWidget()
+        length_lay = QHBoxLayout(length_row)
+        length_lay.setContentsMargins(0, 0, 0, 0)
+        length_lay.setSpacing(8)
+
+        length_lay.addWidget(QLabel("Max Answer Words"))
+        self.max_words_spin = QSpinBox()
+        self.max_words_spin.setRange(0, MAX_ANSWER_WORDS_LIMIT)
+        self.max_words_spin.setSingleStep(10)
+        self.max_words_spin.setSpecialValueText("No limit")
+        self.max_words_spin.setMinimumWidth(100)
+        self.max_words_spin.setToolTip(
+            "Longest answer the bot may type or paste, in words.\n"
+            "0 = no limit, so long explanations arrive complete.\n"
+            "When capped, the answer is cut at the nearest full stop and ends with '...'."
+        )
+        self.max_words_spin.setValue(
+            int(self.cfg.get_path("ai.max_answer_words", DEFAULT_MAX_ANSWER_WORDS) or 0)
+        )
+        self.max_words_spin.valueChanged.connect(self._on_max_words_changed)
+        length_lay.addWidget(self.max_words_spin)
+
+        length_lay.addSpacing(14)
+        length_lay.addWidget(QLabel("Min Answer Words"))
+        self.min_words_spin = QSpinBox()
+        self.min_words_spin.setRange(0, MAX_ANSWER_WORDS_LIMIT)
+        self.min_words_spin.setSingleStep(5)
+        self.min_words_spin.setSpecialValueText("No minimum")
+        self.min_words_spin.setMinimumWidth(100)
+        self.min_words_spin.setToolTip(
+            "Ask the model for at least this many words (0 = no minimum).\n"
+            "A shorter reply is retried once (ai.length_retries); if it is still\n"
+            "short it is used anyway and flagged in the Activity log."
+        )
+        self.min_words_spin.setValue(
+            int(self.cfg.get_path("ai.min_answer_words", DEFAULT_MIN_ANSWER_WORDS) or 0)
+        )
+        self.min_words_spin.valueChanged.connect(self._on_min_words_changed)
+        length_lay.addWidget(self.min_words_spin)
+
+        length_lay.addSpacing(18)
+        length_lay.addWidget(self.human_check)
+        length_lay.addStretch(1)
+        grid.addWidget(length_row, 3, 0, 1, 3)
+
+        # --- what the answer may contain -------------------------------------
+        format_row = QWidget()
+        format_lay = QHBoxLayout(format_row)
+        format_lay.setContentsMargins(0, 0, 0, 0)
+        format_lay.setSpacing(14)
+        format_lay.addWidget(QLabel("Allow In Answer:"))
+        self.format_checks = {}
+        for feature, cfg_key in FORMAT_FEATURES:
+            box = QCheckBox(FORMAT_LABELS.get(feature, feature.replace("_", " ").title()))
+            box.setToolTip(FORMAT_TOOLTIPS.get(feature, ""))
+            box.setChecked(bool(self.cfg.get_path(f"ai.{cfg_key}", False)))
+            box.toggled.connect(
+                lambda checked, name=feature, key=cfg_key:
+                self._on_format_toggled(name, key, checked)
+            )
+            format_lay.addWidget(box)
+            self.format_checks[cfg_key] = box
+        format_lay.addStretch(1)
+        grid.addWidget(format_row, 4, 0, 1, 3)
+
+        grid.addWidget(QLabel("AI Hallucination"), 5, 0)
+        self.hallucination_combo = ChevronComboBox()
+        for level, label in enumerate(HALLUCINATION_LEVELS):
+            self.hallucination_combo.addItem(label, level)
+        current_level = int(
+            self.cfg.get_path("ai.hallucination_level", DEFAULT_HALLUCINATION_LEVEL) or 0
+        )
+        level_index = self.hallucination_combo.findData(current_level)
+        self.hallucination_combo.setCurrentIndex(max(0, level_index))
+        self.hallucination_combo.setMinimumWidth(300)
+        self.hallucination_combo.setToolTip(
+            "How far the AI may go beyond the text it read from the screen:\n"
+            "0 = answer only from what is on screen, 4 = free to invent plausible details."
+        )
+        self.hallucination_combo.currentIndexChanged.connect(self._on_hallucination_changed)
+        grid.addWidget(self.hallucination_combo, 5, 1, 1, 2)
+
+        grid.addWidget(QLabel("Extra Context"), 6, 0)
         self.context_edit = QLineEdit()
         self.context_edit.setPlaceholderText(
             "Optional hint for the AI, e.g. 'this is a login form' or 'answer in one word'"
         )
-        grid.addWidget(self.context_edit, 2, 1, 1, 2)
+        grid.addWidget(self.context_edit, 6, 1, 1, 2)
+
+        # --- background mode + hotkey diagnostics ----------------------------
+        background_row = QWidget()
+        background_lay = QHBoxLayout(background_row)
+        background_lay.setContentsMargins(0, 0, 0, 0)
+        background_lay.setSpacing(12)
+        self.background_check = QCheckBox("Keep Running In Background")
+        self.background_check.setToolTip(
+            "ON: closing this window hides it to the menu bar / tray and the bot keeps\n"
+            "running, so the global hotkeys still work with no window on screen\n"
+            "(like Docker Dashboard). Quit from the tray menu or the Quit button.\n"
+            "OFF: closing the window shuts the bot down."
+        )
+        self.background_check.setChecked(bool(self.cfg.get_path("app.run_in_background", True)))
+        self.background_check.toggled.connect(self._on_background_toggled)
+        background_lay.addWidget(self.background_check)
+
+        self.hotkey_test_btn = QPushButton("Test Hotkeys")
+        self.hotkey_test_btn.setToolTip(
+            "Show whether the OS really delivers your hotkeys, and jump straight to\n"
+            "the macOS Input Monitoring / Accessibility settings when it does not."
+        )
+        self.hotkey_test_btn.clicked.connect(self.show_hotkey_test)
+        background_lay.addWidget(self.hotkey_test_btn)
+        self.hotkey_hint_label = QLabel("")
+        self.hotkey_hint_label.setWordWrap(True)
+        self.hotkey_hint_label.setStyleSheet("color: #f0c674;")
+        background_lay.addWidget(self.hotkey_hint_label, 1)
+        grid.addWidget(background_row, 7, 0, 1, 3)
+
+        # --- audible debug feedback ------------------------------------------
+        sound_row = QWidget()
+        sound_lay = QHBoxLayout(sound_row)
+        sound_lay.setContentsMargins(0, 0, 0, 0)
+        sound_lay.setSpacing(12)
+        self.sound_check = QCheckBox("Debug Sounds")
+        self.sound_check.setToolTip(
+            "ON: play a short sound when a hotkey fires, when the bot clicks/\n"
+            "types, and when a run fails or is cancelled.\n"
+            "OFF: silent (default). Individual cues can be switched in config.json\n"
+            "under 'debug' (sound_hotkey, sound_click, sound_error, ...)."
+        )
+        self.sound_check.setChecked(bool(self.cfg.get_path("debug.sounds", False)))
+        self.sound_check.toggled.connect(self._on_sound_toggled)
+        sound_lay.addWidget(self.sound_check)
+
+        self.sound_test_btn = QPushButton("Test Sounds")
+        self.sound_test_btn.setToolTip("Play the hotkey, click, done and error cues.")
+        self.sound_test_btn.clicked.connect(self.test_sounds)
+        sound_lay.addWidget(self.sound_test_btn)
+
+        self.sound_hint_label = QLabel(self.sounds.describe())
+        self.sound_hint_label.setWordWrap(True)
+        self.sound_hint_label.setStyleSheet("color: #8492a6;")
+        sound_lay.addWidget(self.sound_hint_label, 1)
+        grid.addWidget(sound_row, 8, 0, 1, 3)
+
         grid.setColumnStretch(2, 1)
         return body
 
@@ -758,12 +1110,187 @@ class MainWindow(QMainWindow):
         w.failed.connect(lambda _msg: self._restore_input_window())
         w.finished.connect(self._restore_input_window)
 
+    # ---------------------------------------------------- debug sounds (feedback)
+    def _on_sound_toggled(self, enabled: bool) -> None:
+        """Master switch for the audible debug feedback."""
+        self.cfg.set_path("debug.sounds", bool(enabled))
+        self._save_option("debug.sounds")
+        if hasattr(self, "sound_hint_label"):
+            self.sound_hint_label.setText(self.sounds.describe())
+        self.on_log(f"[sound] Debug sounds {'ON' if enabled else 'OFF'}.")
+        if enabled:
+            self.sounds.play("hotkey")   # immediate confirmation that audio works
+
+    def test_sounds(self) -> None:
+        """Play a few cues so the volume can be judged."""
+        was_enabled = self.sounds.enabled
+        if not was_enabled:
+            self.cfg.set_path("debug.sounds", True)
+        try:
+            level = self.sounds.volume
+            for offset, cue in enumerate(("hotkey", "click", "done", "error")):
+                QTimer.singleShot(offset * 320,
+                                  lambda c=cue: (self.sounds.play(c),
+                                                 self.on_log(f"[sound] cue '{c}'")))
+            self.on_log(f"[sound] Testing cues at {level:.0%} volume.")
+        finally:
+            if not was_enabled:
+                # Restore the switch shortly after the last cue.
+                QTimer.singleShot(1400, lambda: self.cfg.set_path("debug.sounds", False))
+
+    @Slot(str)
+    def _play_sound(self, cue: str) -> None:
+        """Play one cue (always on the GUI thread)."""
+        try:
+            self.sounds.play(cue)
+        except Exception:  # pragma: no cover - audio must never break the UI
+            log.debug("Sound cue %s failed", cue, exc_info=True)
+
+    @Slot(str)
+    def _queue_sound(self, cue: str) -> None:
+        """Thread-safe sound request (hotkey listener thread -> GUI thread)."""
+        if self._on_gui_thread():
+            self._play_sound(cue)
+            return
+        try:
+            QMetaObject.invokeMethod(self, "_play_sound", Qt.QueuedConnection, Q_ARG(str, cue))
+        except Exception:  # pragma: no cover - defensive
+            log.debug("Could not queue sound %s", cue, exc_info=True)
+
+    def _hotkey_missed(self, key_name: str) -> None:
+        """Called from the listener thread when a key matched no shortcut."""
+        if not self.sounds.cue_enabled("hotkey_miss"):
+            return
+        now = time.monotonic()
+        if now - self._last_miss_sound < 0.25:   # never machine-gun the speaker
+            return
+        self._last_miss_sound = now
+        self._queue_sound("hotkey_miss")
+
+
+    def background_enabled(self) -> bool:
+        """True when closing the panel should keep the bot running."""
+        return bool(self.cfg.get_path("app.run_in_background", True))
+
+    def _setup_tray(self) -> None:
+        """Create the status icon and its menu (the 'Docker Dashboard' behaviour)."""
+        from .hotkeys import describe_combo
+        from .tray import TrayController
+
+        controller = TrayController(self, title="ScreenAI Bot")
+        if not controller.available:
+            self.tray = None
+            self.on_log("[tray] No system tray available - closing the window quits.")
+            self._apply_background_policy()
+            return
+        self.tray = controller
+        controller.on_open = self.show_panel
+        controller.add_action("show", "Open Panel", self.show_panel,
+                              tooltip="Bring the control panel back.")
+        controller.add_separator()
+        for key, label in (("run", "Run Now"), ("stop", "Stop"),
+                           ("select_region", "Select Area To Read"),
+                           ("paste_answer", "Paste Last Answer"),
+                           ("toggle_overlay", "Show / Hide Outlines")):
+            combo = self._hotkey_combos.get(key, "")
+            text = f"{label}   {describe_combo(combo)}" if combo else label
+            controller.add_action(key, text, self._hotkey_actions.get(key, lambda: None))
+        controller.add_separator()
+        controller.add_action("test_hotkeys", "Test Hotkeys...", self.show_hotkey_test,
+                              tooltip="Check whether macOS delivers the global hotkeys.")
+        controller.add_action("restart_hotkeys", "Restart Hotkeys",
+                              self.restart_hotkeys,
+                              tooltip="Rebuild the key listener if the shortcuts feel dead.")
+        controller.add_action("quit", "Quit ScreenAI Bot", self.quit_app)
+        controller.show()
+        self._apply_background_policy()
+        self._sync_tray_state()
+        self.on_log(
+            "[tray] Background mode ready - closing the panel keeps the bot running "
+            "in the menu bar / tray."
+            if self.background_enabled()
+            else "[tray] Background mode is off - closing the panel quits the bot."
+        )
+
+    def _apply_background_policy(self) -> None:
+        """Keep the process alive when the window closes (if that is wanted)."""
+        app = QApplication.instance()
+        if app is not None:
+            keep_alive = self.background_enabled() and self.tray is not None
+            app.setQuitOnLastWindowClosed(not keep_alive)
+
+    @Slot(bool)
+    def _on_background_toggled(self, enabled: bool) -> None:
+        self.cfg.set_path("app.run_in_background", bool(enabled))
+        self._save_option("app.run_in_background")
+        self._apply_background_policy()
+        self.on_log(
+            "[tray] Closing the panel now keeps the bot running in the background."
+            if enabled else
+            "[tray] Closing the panel now quits the bot."
+        )
+
+    def show_panel(self) -> None:
+        """Bring the control panel back (tray click, hotkey, or menu item)."""
+        self._tray_hidden = False
+        set_dock_icon_visible(True)
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if self.tray is not None:
+            self._sync_tray_state()
+
+    def hide_to_tray(self, log_hint: bool = True) -> None:
+        """Hide the panel but keep the process (and the hotkeys) alive."""
+        self._tray_hidden = True
+        self.hide()
+        if IS_MACOS and bool(self.cfg.get_path("app.hide_dock_icon", True)):
+            set_dock_icon_visible(False)
+        if log_hint:
+            self.on_log("[tray] Panel hidden - the bot keeps running in the background.")
+        if self.tray is not None:
+            self._sync_tray_state()
+
+    def quit_app(self) -> None:
+        """Really exit: tray 'Quit', the nav bar button, or Ctrl+Q."""
+        self._quitting = True
+        self._shutdown()
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _sync_tray_state(self) -> None:
+        """Keep the tray menu/tooltip in step with what the bot is doing."""
+        if self.tray is None:
+            return
+        busy = bool(getattr(self, "_busy", False))
+        self.tray.set_action_enabled("run", not busy)
+        self.tray.set_action_enabled("stop", busy)
+        self.tray.set_action_enabled("paste_answer", self.worker.last_answer is not None)
+        self.tray.set_tooltip(
+            "Running - press Stop to cancel" if busy
+            else "Idle - click to open the panel"
+        )
+
     def _register_hotkeys(self) -> None:
+        """Bind the global hotkeys *and* in-app Qt shortcuts.
+
+        Both paths are always installed and share one dispatcher, because on
+        macOS the global listener starts without error even when macOS is
+        blocking it - the in-app shortcuts are then the only thing that works,
+        and a single dispatcher prevents a key press from firing twice.
+        """
         from .hotkeys import HotkeyManager
 
-        self.hotkeys = HotkeyManager(str(self.cfg.get_path("hotkey_backend", "pynput")))
+        self.hotkeys = HotkeyManager(
+            str(self.cfg.get_path("hotkey_backend", "pynput")),
+            max_restarts=int(self.cfg.get_path("app.hotkey_max_restarts", 2) or 0),
+        )
         hk = self.cfg.get_path("hotkeys", {}) or {}
-        mapping = {
+        self._hotkey_actions = {
             "select_region": self.select_source_region,
             "run": self.run_pipeline,
             "stop": self.stop_pipeline,
@@ -771,41 +1298,151 @@ class MainWindow(QMainWindow):
             "paste_answer": self.paste_last_answer,
             "toggle_overlay": self.toggle_marker,
         }
-        started = 0
-        for key, handler in mapping.items():
-            combo = hk.get(key)
-            if combo and self.hotkeys.register(combo, handler):
-                started += 1
-        if started and self.hotkeys.start():
-            self.on_log(f"Global hotkeys active ({started} bindings).")
-        else:
-            self.hotkeys.stop()
-            self._bind_local_shortcuts(hk)
-            self.on_log("Global hotkeys unavailable - using app-window shortcuts instead.")
-
-    def _bind_local_shortcuts(self, hk: dict) -> None:
-        from .hotkeys import LocalHotkeyFallback, _qt_sequence
-
-        fallback = LocalHotkeyFallback(self)
-        mapping = {
-            "select_region": self.select_source_region,
-            "run": self.run_pipeline,
-            "stop": self.stop_pipeline,
-            "paste_answer": self.paste_last_answer,
-            "toggle_overlay": self.toggle_marker,
+        # Beep when a key press matched nothing (opt-in debug aid).
+        self.hotkeys.on_unmatched = self._hotkey_missed
+        self._hotkey_combos = {
+            key: str(hk.get(key) or "").strip() for key in self._hotkey_actions
         }
-        for key, handler in mapping.items():
-            combo = hk.get(key)
+        registered = 0
+        for key in self._hotkey_actions:
+            combo = self._hotkey_combos.get(key)
+            if combo and self.hotkeys.register(
+                combo, lambda k=key: self._queue_hotkey(k)
+            ):
+                registered += 1
+
+        started = bool(registered) and self.hotkeys.start()
+        # In-app shortcuts are cheap and always useful (they also cover the case
+        # where the OS withholds the global permission).
+        self._bind_local_shortcuts()
+        if started:
+            self.on_log(f"Global hotkeys active ({registered} bindings) - "
+                        "they work even when this window is hidden.")
+        else:
+            self.on_log("Global hotkeys unavailable - in-app shortcuts still work.")
+        from .hotkeys import describe_combo
+
+        shown = "  ".join(
+            f"{describe_combo(combo)}={name}"
+            for name, combo in self._hotkey_combos.items() if combo
+        )
+        if shown:
+            self.on_log(f"[hotkeys] Bound: {shown}")
+            if IS_MACOS:
+                self.on_log(
+                    "[hotkeys] Mac keys: Control is \u2303, Alt is Option \u2325 "
+                    "(\u2318 Command is a different modifier - Ctrl+Alt+Enter is "
+                    "Control+Option+Return)."
+                )
+        hint = hotkey_permission_hint()
+        if hint:
+            self.on_log(f"[macos] {hint}")
+            log.warning("Hotkeys may be blocked: %s", hint)
+        label = getattr(self, "hotkey_hint_label", None)
+        if label is not None:
+            label.setText(hint or "")
+
+    def _bind_local_shortcuts(self) -> None:
+        """Qt-level shortcuts (work while the panel has focus, on every OS)."""
+        from .hotkeys import _qt_sequence
+
+        self._local_shortcuts: List[QShortcut] = []
+        for key, combo in self._hotkey_combos.items():
             if not combo:
                 continue
-            shortcut = QShortcut(_qt_sequence(combo), self)
+            try:
+                shortcut = QShortcut(_qt_sequence(combo), self)
+            except Exception:  # pragma: no cover - unsupported key sequence
+                log.warning("Could not bind local shortcut for %s", combo)
+                continue
             shortcut.setContext(Qt.ApplicationShortcut)
-            shortcut.activated.connect(handler)
+            shortcut.activated.connect(lambda k=key: self._trigger_hotkey(k))
+            self._local_shortcuts.append(shortcut)
+
+    def _queue_hotkey(self, action: str) -> None:
+        """Called from the pynput thread: hop to the GUI thread, never touch Qt here."""
+        if self._on_gui_thread():
+            self._trigger_hotkey(action)
+            return
+        try:
+            QMetaObject.invokeMethod(
+                self, "_trigger_hotkey", Qt.QueuedConnection, Q_ARG(str, action)
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Could not dispatch hotkey %s", action)
+
+    @Slot(str)
+    def _trigger_hotkey(self, action: str) -> None:
+        """Run one hotkey action, de-duplicated across the global/local bindings."""
+        now = time.monotonic()
+        if now - self._hotkey_fired_at.get(action, 0.0) < 0.4:
+            return
+        self._hotkey_fired_at[action] = now
+        handler = self._hotkey_actions.get(action)
+        if handler is None:
+            return
+        self.on_log(f"[hotkey] {action} ({self._hotkey_combos.get(action, '')})")
+        self._play_sound("hotkey")
+        try:
+            handler()
+        except Exception:
+            log.exception("Hotkey action %s failed", action)
+            self.on_failed(f"Hotkey '{action}' failed - see the log for details.")
+
+    def show_hotkey_test(self) -> None:
+        """Open the diagnostics dialog that proves whether key events arrive."""
+        dialog = HotkeyTestDialog(self.hotkeys, self, combos=self._hotkey_combos)
+        dialog.exec()
+
+    def restart_hotkeys(self) -> None:
+        """Rebuild the global listener (fixes a tap that macOS silently killed).
+
+        Asynchronous: destroying a pynput/CoreFoundation listener inline is what
+        produced ``zsh: trace trap`` crashes, so the rebuild happens on its own
+        thread and the old listener is joined first.
+        """
+        if self.hotkeys is None:
+            return
+        self.hotkeys.restart("requested from the UI", manual=True)
+        self.on_log(
+            "[hotkey] Rebuilding the listener in the background - "
+            "the shortcuts come back in a second or two."
+        )
+
+    def _hotkey_watchdog(self) -> None:
+        """Periodic tick: revive a dead listener and keep the tray state honest."""
+        if self.hotkeys is None or self._quitting:
+            return
+        before = self.hotkeys.restart_count
+        try:
+            self.hotkeys.ensure_alive()
+        except Exception:  # pragma: no cover - never break the event loop
+            log.exception("Hotkey watchdog failed")
+            return
+        if self.hotkeys.restart_count != before:
+            self.on_log(
+                "[hotkey] The OS had stopped delivering keys - listener rebuilt "
+                f"(restart #{self.hotkeys.restart_count} of "
+                f"{max(self.hotkeys.max_restarts, 1)})."
+            )
+        if self.hotkeys.gave_up and not getattr(self, "_gave_up_logged", False):
+            self._gave_up_logged = True
+            self.on_log(
+                "[hotkey] Automatic recovery paused. If the shortcuts are still dead, "
+                "use the tray menu > Restart Hotkeys (or check the macOS permissions)."
+            )
+        hint = self.hotkeys.blocked_hint()
+        if hint and hint != getattr(self, "_blocked_hint_shown", ""):
+            self._blocked_hint_shown = hint
+            self.on_log(f"[hotkey] {hint}")
+            log.warning("%s", hint)
+
 
     # ------------------------------------------------------------- AI settings
     def _init_ai_fields(self) -> None:
         """Fill the AI provider/model/key widgets from the loaded config."""
         self._sync_ai_fields_from_cfg()
+        self._sync_answer_options_from_cfg()
 
     def _sync_ai_fields_from_cfg(self) -> None:
         provider = str(self.cfg.get_path("ai.provider", "openai")).lower()
@@ -906,6 +1543,7 @@ class MainWindow(QMainWindow):
         self.cfg.data.update(merged)
         self._sync_ai_fields_from_cfg()
         self._sync_action_fields_from_cfg()
+        self._sync_answer_options_from_cfg()
         self._refresh_regions()
         self._dump_config_view()
         self.on_log(f"[config] Reloaded {self.cfg.path}.")
@@ -958,6 +1596,8 @@ class MainWindow(QMainWindow):
             self.click_flash.hide()
 
     def _flash_pointer(self, x: int, y: int, kind: str) -> None:
+        # Audible confirmation that the bot is really clicking (debug sounds).
+        self._play_sound("click")
         if not self.cfg.get_path("actions.debug_pointer", False):
             return
         self.click_flash.flash(x, y, kind)
@@ -1167,8 +1807,13 @@ class MainWindow(QMainWindow):
         if delay:
             time.sleep(delay / 1000.0)
 
-    def _begin_hide(self, reason: str) -> None:
-        """Hide the window and arm a watchdog so it always comes back."""
+    def _begin_hide(self, reason: str, hold: bool = False) -> None:
+        """Hide the window and arm a watchdog so it always comes back.
+
+        ``hold=True`` is used while the answer is being written: the panel may
+        legitimately stay hidden for as long as the typing takes, so the
+        watchdog uses the much longer writing timeout instead of the default.
+        """
         if self._hidden_for_action:
             return
         self._hidden_for_action = True
@@ -1178,8 +1823,12 @@ class MainWindow(QMainWindow):
         log.info("Hiding bot window (%s)", reason)
         self.on_log(f"[window] Hidden ({reason}) - the click reaches the app underneath.")
         # The watchdog must never fire while a legitimate restore delay runs.
+        base = int(self.cfg.get_path("actions.auto_hide_max_ms", 8000) or 8000)
+        if hold:
+            writing = int(self.cfg.get_path("actions.auto_hide_writing_max_ms", 60000) or 0)
+            base = max(base, writing)
         timeout = max(
-            int(self.cfg.get_path("actions.auto_hide_max_ms", 8000) or 8000),
+            base,
             int(self.cfg.get_path("actions.restore_delay_ms", 1000) or 0) + 3000,
         )
         QTimer.singleShot(timeout, lambda: self._force_restore(gen))
@@ -1198,11 +1847,23 @@ class MainWindow(QMainWindow):
             self._hide_event = None
             event.set()
 
-    @Slot(int, int, bool)
-    def _prepare_input_window(self, x: int, y: int, will_click: bool) -> None:
-        """Hide the bot window when it covers where input is about to be sent."""
+    @Slot(int, int, bool, bool)
+    def _prepare_input_window(self, x: int, y: int, will_click: bool,
+                              hold_hidden: bool = False) -> None:
+        """Hide the bot window when it covers where input is about to be sent.
+
+        ``hold_hidden`` is set for the "answer" task with a type-into-a-field
+        action mode: the panel then stays hidden from the first click until the
+        whole answer has been typed, even when the target area is nowhere near it.
+        """
         try:
             if not bool(self.cfg.get_path("actions.auto_hide_window", True)):
+                return
+            if hold_hidden:
+                # Only hide a panel that is actually on screen: one the user
+                # minimised (or already hidden) is out of the way and stays so.
+                if self.isVisible():
+                    self._begin_hide("writing the answer", hold=True)
                 return
             covers = self._point_under_window(x, y)
             # Typing without a click goes to whichever app is frontmost, so move
@@ -1244,6 +1905,10 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_hidden_for_action", False):
             return
         self._hidden_for_action = False
+        # The user closed the panel to the tray: never pop it back up on them.
+        if getattr(self, "_tray_hidden", False):
+            log.info("Bot window stays in the background (closed to the tray)")
+            return
         if self.isMinimized():
             self.showNormal()
         self.show()
@@ -1262,16 +1927,20 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         return app is not None and QThread.currentThread() == app.thread()
 
-    def _hide_for_input_sync(self, x: int, y: int, will_click: bool = True) -> bool:
+    def _hide_for_input_sync(self, x: int, y: int, will_click: bool = True,
+                             hold_hidden: bool = False) -> bool:
         """Worker-thread safe: hide the window before input events fire.
 
         The GUI thread is never blocked: the hide is posted to it, *this* thread
         waits on an Event, and the settle delay happens here on the worker.
         Returns True when the panel is hidden (so callers know to wait before
         showing it again).
+
+        ``hold_hidden`` keeps the panel hidden until the answer has been typed
+        completely instead of only for the duration of the click.
         """
         if self._on_gui_thread():
-            self._prepare_input_window(x, y, will_click)
+            self._prepare_input_window(x, y, will_click, hold_hidden)
             self._wait_for_window_server()
             return bool(self._hidden_for_action)
         done = threading.Event()
@@ -1280,6 +1949,7 @@ class MainWindow(QMainWindow):
             QMetaObject.invokeMethod(
                 self, "_prepare_input_window", Qt.QueuedConnection,
                 Q_ARG(int, int(x)), Q_ARG(int, y), Q_ARG(bool, bool(will_click)),
+                Q_ARG(bool, bool(hold_hidden)),
             )
         except Exception as exc:  # pragma: no cover - defensive
             self._hide_event = None
@@ -1321,6 +1991,102 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("Could not restore the window after acting: %s", exc)
 
+    # -------------------------------------------------- answer shaping options
+    def _save_option(self, dotted: str) -> None:
+        """Persist one option change; never raise into the Qt event loop."""
+        try:
+            self.cfg.save()
+        except Exception as exc:  # pragma: no cover - filesystem failures
+            log.warning("Could not persist %s: %s", dotted, exc)
+        self._dump_config_view()
+
+    def _on_max_words_changed(self, value: int) -> None:
+        """Cap (or uncap, when 0) how many answer words are typed/pasted."""
+        self.cfg.set_path("ai.max_answer_words", int(value))
+        minimum = int(self.min_words_spin.value())
+        if value > 0 and minimum > value:
+            # A minimum larger than the cap cannot be satisfied: pull it down.
+            self.min_words_spin.blockSignals(True)
+            self.min_words_spin.setValue(int(value))
+            self.min_words_spin.blockSignals(False)
+            self.cfg.set_path("ai.min_answer_words", int(value))
+            self.on_log(f"[ai] Minimum reduced to {value} words to match the maximum.")
+        self._save_option("ai.max_answer_words")
+        if value <= 0:
+            self.on_log("[ai] Answer length: no maximum.")
+        else:
+            self.on_log(f"[ai] Answer length capped at {value} words.")
+
+    def _on_min_words_changed(self, value: int) -> None:
+        """Ask the model for a minimum number of words (0 = no minimum)."""
+        self.cfg.set_path("ai.min_answer_words", int(value))
+        maximum = int(self.max_words_spin.value())
+        if maximum > 0 and value > maximum:
+            # Raise the cap instead of holding an impossible pair.
+            self.max_words_spin.blockSignals(True)
+            self.max_words_spin.setValue(int(value))
+            self.max_words_spin.blockSignals(False)
+            self.cfg.set_path("ai.max_answer_words", int(value))
+            self.on_log(f"[ai] Maximum raised to {value} words to allow the minimum.")
+        self._save_option("ai.min_answer_words")
+        if value <= 0:
+            self.on_log("[ai] Answer length: no minimum.")
+        else:
+            self.on_log(f"[ai] Answer must be at least {value} words.")
+
+    def _on_format_toggled(self, feature: str, cfg_key: str, enabled: bool) -> None:
+        """Allow or forbid one answer format (markdown / html / code / lists)."""
+        self.cfg.set_path(f"ai.{cfg_key}", bool(enabled))
+        self._save_option(f"ai.{cfg_key}")
+        label = FORMAT_LABELS.get(feature, feature)
+        self.on_log(f"[ai] {label} in answers {'allowed' if enabled else 'disabled'}.")
+
+    def _on_hallucination_changed(self, _index: int) -> None:
+        """Remember how far the model may go beyond the captured text."""
+        level = self.hallucination_combo.currentData()
+        if level is None:
+            return
+        self.cfg.set_path("ai.hallucination_level", int(level))
+        self._save_option("ai.hallucination_level")
+        self.on_log(f"[ai] Hallucination level: {self.hallucination_combo.currentText()}")
+
+    def _on_human_toggled(self, enabled: bool) -> None:
+        """Turn the chat-style (human sounding) answer directive on or off."""
+        self.cfg.set_path("ai.natural_answers", bool(enabled))
+        self._save_option("ai.natural_answers")
+        self.on_log(f"[ai] Human-style answers {'ON' if enabled else 'OFF'}.")
+
+    def _sync_answer_options_from_cfg(self) -> None:
+        """Mirror length / level / style / format options from config into widgets."""
+        self.max_words_spin.blockSignals(True)
+        self.max_words_spin.setValue(
+            int(self.cfg.get_path("ai.max_answer_words", DEFAULT_MAX_ANSWER_WORDS) or 0)
+        )
+        self.max_words_spin.blockSignals(False)
+
+        self.min_words_spin.blockSignals(True)
+        self.min_words_spin.setValue(
+            int(self.cfg.get_path("ai.min_answer_words", DEFAULT_MIN_ANSWER_WORDS) or 0)
+        )
+        self.min_words_spin.blockSignals(False)
+
+        self.human_check.blockSignals(True)
+        self.human_check.setChecked(bool(self.cfg.get_path("ai.natural_answers", False)))
+        self.human_check.blockSignals(False)
+
+        for cfg_key, box in self.format_checks.items():
+            box.blockSignals(True)
+            box.setChecked(bool(self.cfg.get_path(f"ai.{cfg_key}", False)))
+            box.blockSignals(False)
+
+        level = int(
+            self.cfg.get_path("ai.hallucination_level", DEFAULT_HALLUCINATION_LEVEL) or 0
+        )
+        index = self.hallucination_combo.findData(level)
+        self.hallucination_combo.blockSignals(True)
+        self.hallucination_combo.setCurrentIndex(max(0, index))
+        self.hallucination_combo.blockSignals(False)
+
     def _on_confirm_toggled(self, enabled: bool) -> None:
         self.cfg.set_path("actions.confirm_before_action", bool(enabled))
         try:
@@ -1337,12 +2103,17 @@ class MainWindow(QMainWindow):
         pairs = (
             (self.confirm_check, "actions.confirm_before_action", True),
             (self.hide_check, "actions.auto_hide_window", True),
+            (self.hold_hidden_check, "actions.hide_until_writing_done", True),
+            (self.background_check, "app.run_in_background", True),
+            (self.sound_check, "debug.sounds", False),
         )
         for box, key, default in pairs:
             value = bool(self.cfg.get_path(key, default))
             box.blockSignals(True)
             box.setChecked(value)
             box.blockSignals(False)
+        if hasattr(self, "sound_hint_label"):
+            self.sound_hint_label.setText(self.sounds.describe())
 
     def _on_hide_window_toggled(self, enabled: bool) -> None:
         self.cfg.set_path("actions.auto_hide_window", bool(enabled))
@@ -1352,9 +2123,35 @@ class MainWindow(QMainWindow):
             log.warning("Could not persist auto_hide_window: %s", exc)
         self.on_log(f"[window] Auto-hide while acting {'ON' if enabled else 'OFF'}.")
 
+    def _on_hold_hidden_toggled(self, enabled: bool) -> None:
+        """Keep the panel hidden from the first click until typing has finished."""
+        self.cfg.set_path("actions.hide_until_writing_done", bool(enabled))
+        try:
+            self.cfg.save()
+        except Exception as exc:  # pragma: no cover - filesystem failures
+            log.warning("Could not persist hide_until_writing_done: %s", exc)
+        self._dump_config_view()
+        if enabled:
+            modes = self.cfg.get_path("actions.hide_until_writing_modes", []) or []
+            tasks = self.cfg.get_path("actions.hide_until_writing_tasks", []) or []
+            self.on_log(
+                "[window] Panel stays hidden until typing ends for task(s) "
+                f"{', '.join(str(t) for t in tasks) or 'any'} with mode(s) "
+                f"{', '.join(str(m) for m in modes) or 'none'}."
+            )
+        else:
+            self.on_log("[window] Panel is only hidden for the click itself.")
+
     def build_request(self, text_override: Optional[str] = None) -> Optional[PipelineRequest]:
         if self.source_region is None:
-            QMessageBox.warning(self, "ScreenAI", "No area selected. Use 'Select Area To Read' first.")
+            # Pressing the Run hotkey from the background would otherwise look
+            # like nothing happened: bring the panel forward before warning.
+            if not self.isVisible():
+                self.show_panel()
+            self._play_sound("error")
+            QMessageBox.warning(self, "ScreenAI",
+                                "No area selected. Use 'Select Area To Read' first.")
+            self.on_log("[run] Blocked: no read area selected yet.")
             return None
         mode = self.mode_combo.currentData()
         if self.cursor_check.isChecked():
@@ -1394,6 +2191,8 @@ class MainWindow(QMainWindow):
         self._busy = True
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self._sync_tray_state()
+        self._play_sound("start")
         self.thread = WorkerThread(self.worker, request, parent=self)
         self.thread.start()
         self.on_log(f"RUN start: {request.source_region} task={request.task_key} mode={request.mode}")
@@ -1405,6 +2204,9 @@ class MainWindow(QMainWindow):
         request = self.build_request()
         if request is None:
             return
+        # This path skips worker.run(), so register the request (and its
+        # panel-hiding policy) explicitly before the action stage runs.
+        self.worker.apply_request(request)
 
         def worker_call() -> None:
             try:
@@ -1449,6 +2251,9 @@ class MainWindow(QMainWindow):
         if request is None:
             return
         self.on_log(f"APPLY: mode={request.mode}")
+        # Remember the request so execute_steps() applies the same panel-hiding
+        # policy as a full run (stay hidden until the answer has been typed).
+        self.worker.apply_request(request)
         if request.mode == "click_matching_line":
             from .ai_client import AiAnswer
             self.worker._act_click_matching_line(
@@ -1523,10 +2328,16 @@ class MainWindow(QMainWindow):
         self.steps_view.clear()
         for line in descriptions:
             self.steps_view.addItem(line)
+        if descriptions:
+            self._play_sound("type")   # the bot is about to type/paste
         if self.cfg.get_path("actions.confirm_before_action", True):
             self._confirm_pending()
 
     def _confirm_pending(self) -> None:
+        # Running from the tray/hotkey keeps the panel hidden; a confirmation
+        # dialog needs a visible owner or it can appear behind other apps.
+        if not self.isVisible():
+            self.show_panel()
         lines = "\n".join(f"  - {self.steps_view.item(i).text()}" for i in range(self.steps_view.count()))
         choice = QMessageBox.question(
             self, "Confirm actions",
@@ -1537,20 +2348,25 @@ class MainWindow(QMainWindow):
             self.worker.execute_steps()
         elif choice == QMessageBox.Abort:
             self.worker._pending_steps = []
+            self._play_sound("cancel")
             self.on_status("Cancelled - nothing was typed.")
         else:
             self.worker._pending_steps = []
+            self._play_sound("cancel")
             if self.worker.last_answer:
                 self.worker.input.copy_to_clipboard(self.worker.last_answer.text)
             self.on_status("Declined - answer copied to clipboard instead.")
 
     def on_action_done(self, result) -> None:
         if result.ok:
+            self._play_sound("done")
             self.on_log(f"Actions OK ({result.executed} steps)")
         else:
+            self._play_sound("error")
             self.on_log(f"Actions incomplete: {result.error}")
 
     def on_failed(self, message: str) -> None:
+        self._play_sound("error")
         self.on_log(f"ERROR: {message}")
         self.statusBar().showMessage(f"Failed: {message}")
 
@@ -1562,6 +2378,7 @@ class MainWindow(QMainWindow):
             self.thread.wait(1500)
             self.thread = None
         self.statusBar().showMessage("Ready.")
+        self._sync_tray_state()
 
     # ------------------------------------------------------------------- health
     def _health_check(self) -> None:
@@ -1571,6 +2388,39 @@ class MainWindow(QMainWindow):
         checks.append(("Regions", f"{len(self.cfg.regions)} saved" if self.cfg.regions else "none yet"))
         checks.append(("Provider", f"{self.cfg.get_path('ai.provider')}/{self.cfg.get_path('ai.model')}"))
         checks.append(("Vision mode", "on" if self.cfg.get_path("ai.use_vision") else "off"))
+        max_words = int(
+            self.cfg.get_path("ai.max_answer_words", DEFAULT_MAX_ANSWER_WORDS) or 0
+        )
+        min_words = int(
+            self.cfg.get_path("ai.min_answer_words", DEFAULT_MIN_ANSWER_WORDS) or 0
+        )
+        allowed = [
+            FORMAT_LABELS.get(feature, feature)
+            for feature, cfg_key in FORMAT_FEATURES
+            if self.cfg.get_path(f"ai.{cfg_key}", False)
+        ]
+        checks.append((
+            "Answer shaping",
+            f"max {'none' if max_words <= 0 else max_words} words, "
+            f"min {'none' if min_words <= 0 else min_words} words, "
+            f"hallucination {self.cfg.get_path('ai.hallucination_level', DEFAULT_HALLUCINATION_LEVEL)}, "
+            f"human-style {'on' if self.cfg.get_path('ai.natural_answers') else 'off'}, "
+            f"formats: {', '.join(allowed) if allowed else 'plain text'}",
+        ))
+        checks.append((
+            "Background mode",
+            "on - closing the panel keeps the bot in the menu bar / tray"
+            if self.background_enabled() and self.tray is not None
+            else ("off - closing the panel quits" if not self.background_enabled()
+                  else "unavailable - no system tray on this desktop"),
+        ))
+        checks.append((
+            "Global hotkeys",
+            f"{len(self._hotkey_combos)} bindings, listener "
+            f"{'running' if self.hotkeys.running else 'stopped'}",
+        ))
+        if IS_MACOS:
+            checks.append(("macOS permissions", permission_report()))
         for name, value in checks:
             self.on_log(f"[check] {name}: {value}")
         if not self.cfg.api_key:
@@ -1583,9 +2433,9 @@ class MainWindow(QMainWindow):
 
         if sys.platform == "darwin":
             self.on_log(
-                "[macos] If clicks or global hotkeys are ignored, enable Accessibility "
-                "(and Input Monitoring) for your terminal/IDE in "
-                "System Settings > Privacy & Security, then restart the app."
+                "[macos] Clicks need Accessibility; global hotkeys need Input Monitoring "
+                "(System Settings > Privacy & Security). Use 'Test Hotkeys' in Options to "
+                "check, or the tray menu > Test Hotkeys."
             )
 
     def _dump_config_view(self) -> None:
@@ -1598,16 +2448,44 @@ class MainWindow(QMainWindow):
             ai["api_key"] = _mask_secret(str(ai["api_key"]))
         self.config_view.setPlainText(json.dumps(view, indent=2, ensure_ascii=False))
 
+    def _shutdown(self) -> None:
+        """Release everything: worker, hotkeys, tray icon and helper windows."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        steps = (
+            ("worker", lambda: self.worker.stop()),
+            ("thread", lambda: self.thread.wait(2000) if self.thread is not None else None),
+            ("hotkeys", lambda: self.hotkeys.stop()),
+            ("capture", lambda: self.worker.capture.close()),
+            ("click flash", lambda: self.click_flash.close()),
+            ("marker", lambda: self.marker.close()),
+            ("tray", lambda: self.tray.hide() if self.tray is not None else None),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception:
+                log.exception("shutdown issue (%s)", name)
+        set_dock_icon_visible(True)  # never leave the Dock icon missing
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        try:
-            self.worker.stop()
-            if self.thread is not None:
-                self.thread.wait(2000)
-            self.hotkeys.stop()
-            self.worker.capture.close()
-            self.click_flash.close()
-        except Exception:
-            log.exception("shutdown issue")
+        """Close to the menu bar instead of quitting ("Docker Dashboard" style)."""
+        if not self._quitting and self.background_enabled() and self.tray is not None:
+            event.ignore()
+            self.hide_to_tray()
+            if not self._close_hint_shown:
+                self._close_hint_shown = True
+                if bool(self.cfg.get_path("app.tray_notifications", True)):
+                    self.tray.notify(
+                        "ScreenAI Bot is still running",
+                        "Use the menu-bar icon to open the panel, run the bot, or quit.",
+                    )
+                self.statusBar().showMessage(
+                    "Still running in the background - click the menu-bar icon to reopen."
+                )
+            return
+        self._shutdown()
         super().closeEvent(event)
 
 
