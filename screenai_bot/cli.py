@@ -28,9 +28,11 @@ import sys
 from typing import List, Optional
 
 from .actions import ActionPlanner, InputController
-from .ai_client import AIClient
+from .ai_client import (
+    AIClient, cap_answer, count_words, max_answer_words, min_answer_words,
+)
 from .capture import ScreenCapture
-from .config import Config, Region, load_config
+from .config import Config, HALLUCINATION_LEVELS, Region, load_config
 from .ocr import OcrEngine, OcrResult
 
 
@@ -64,6 +66,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", help="Run OCR on a PNG file instead of the live screen")
     parser.add_argument("--task", default="answer", help="Task key from config.prompt.tasks")
     parser.add_argument("--context", default="", help="Extra context appended to the prompt")
+    parser.add_argument("--max-answer-words", "--max-words", dest="max_answer_words", type=int,
+                        metavar="N",
+                        help="Trim the answer to N words (0 = no limit; default from config)")
+    parser.add_argument("--min-answer-words", "--min-words", dest="min_answer_words", type=int,
+                        metavar="N",
+                        help="Ask the model for at least N words (0 = no minimum)")
+    parser.add_argument("--markdown", dest="allow_markdown", action="store_true", default=None,
+                        help="Let the answer use Markdown formatting")
+    parser.add_argument("--no-markdown", dest="allow_markdown", action="store_false",
+                        help="Keep the answer free of Markdown")
+    parser.add_argument("--html", dest="allow_html", action="store_true", default=None,
+                        help="Let the answer use HTML tags")
+    parser.add_argument("--no-html", dest="allow_html", action="store_false",
+                        help="Keep the answer free of HTML")
+    parser.add_argument("--code", dest="allow_code", action="store_true", default=None,
+                        help="Let the answer use code blocks")
+    parser.add_argument("--no-code", dest="allow_code", action="store_false",
+                        help="Keep the answer free of code blocks")
+    parser.add_argument("--bullets", dest="allow_bullet_lists", action="store_true", default=None,
+                        help="Let the answer use bullet or numbered lists")
+    parser.add_argument("--no-bullets", dest="allow_bullet_lists", action="store_false",
+                        help="Keep the answer free of bullet lists")
+    parser.add_argument("--hallucination", type=int, metavar="0-4",
+                        choices=list(range(len(HALLUCINATION_LEVELS))),
+                        help="How far the AI may go beyond the screen text: "
+                             + "; ".join(HALLUCINATION_LEVELS))
+    parser.add_argument("--natural", dest="natural_answers", action="store_true", default=None,
+                        help="Answer the way a human would type it (chat-style wording)")
+    parser.add_argument("--no-natural", dest="natural_answers", action="store_false",
+                        help="Turn human-style answers off")
     parser.add_argument("--target", help="Destination area left,top,width,height for the answer")
     parser.add_argument("--mode", default="type_in_region",
                         choices=list(ActionPlanner.MODES), help="How to deliver the answer")
@@ -95,6 +127,23 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> None:
         cfg.set_path("ai.api_key", args.api_key)
     if args.vision:
         cfg.set_path("ai.use_vision", True)
+    if args.max_answer_words is not None:
+        cfg.set_path("ai.max_answer_words", max(0, int(args.max_answer_words)))
+    if args.min_answer_words is not None:
+        cfg.set_path("ai.min_answer_words", max(0, int(args.min_answer_words)))
+    for flag, key in (
+        ("allow_markdown", "allow_markdown"),
+        ("allow_html", "allow_html"),
+        ("allow_code", "allow_code"),
+        ("allow_bullet_lists", "allow_bullet_lists"),
+    ):
+        value = getattr(args, flag, None)
+        if value is not None:
+            cfg.set_path(f"ai.{key}", bool(value))
+    if args.hallucination is not None:
+        cfg.set_path("ai.hallucination_level", int(args.hallucination))
+    if args.natural_answers is not None:
+        cfg.set_path("ai.natural_answers", bool(args.natural_answers))
     if args.yes:
         cfg.set_path("actions.confirm_before_action", False)
 
@@ -162,7 +211,7 @@ def _vision_transcribe_cli(cfg: Config, image, verbose: bool) -> Optional[OcrRes
     cfg.set_path("prompt.user_template", "{{TEXT}}")
     try:
         stub = OcrResult(text=user, confidence=100.0, engine="vision-ocr")
-        answer = AIClient(cfg).ask(stub, task_key="answer", image=image)
+        answer = AIClient(cfg).ask(stub, task_key="answer", image=image, apply_limits=False)
     except Exception as exc:
         print(f"[warn] vision transcription failed: {exc}", file=sys.stderr)
         return None
@@ -237,9 +286,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         payload.update(ok=False, stage="ai", error=str(exc))
         _emit(args, payload)
         return 4
+    max_words = max_answer_words(cfg)
+    min_words = min_answer_words(cfg)
+    answer.text = cap_answer(answer.text, max_words, min_words)
+    if answer.truncated:
+        print("[warn] The model stopped at its token limit; the answer may be incomplete. "
+              "Raise ai.max_tokens or lower --max-words.", file=sys.stderr)
+    if min_words > 0 and count_words(answer.text) < min_words:
+        print(f"[warn] Answer has {count_words(answer.text)} words, below the "
+              f"{min_words}-word minimum (-min-words).", file=sys.stderr)
     payload.update(stage="ai_done", answer=answer.text, model=answer.model,
                    provider=answer.provider, latency_ms=answer.latency_ms,
-                   ocr_text=ocr.text, ocr_confidence=ocr.confidence)
+                   ocr_text=ocr.text, ocr_confidence=ocr.confidence,
+                   answer_words=count_words(answer.text),
+                   answer_truncated=bool(answer.truncated),
+                   answer_below_minimum=bool(answer.short),
+                   max_answer_words=max_words, min_answer_words=min_words,
+                   formats={key: bool(cfg.get_path(f"ai.{key}", False)) for key in (
+                       "allow_markdown", "allow_html", "allow_code", "allow_bullet_lists")},
+                   hallucination_level=cfg.get_path("ai.hallucination_level", 2),
+                   natural_answers=bool(cfg.get_path("ai.natural_answers", False)))
 
     if args.ask_only or args.dry_run:
         payload.update(ok=True, acted=False)
