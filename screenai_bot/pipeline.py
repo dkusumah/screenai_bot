@@ -26,7 +26,10 @@ from typing import Any, List, Optional
 from PySide6.QtCore import QObject, Signal
 
 from .actions import ActionPlanner, ActionResult, InputController, pointer_position
-from .ai_client import AIClient, AiAnswer, build_prompt
+from .ai_client import (
+    AIClient, AiAnswer, build_prompt, cap_answer, count_words,
+    max_answer_words, min_answer_words,
+)
 from .capture import ScreenCapture
 from .config import Config, Region
 from .ocr import OcrEngine, OcrResult
@@ -64,6 +67,28 @@ class PipelineRequest:
         self.label = label or source_region.name
 
 
+def hold_panel_until_done(cfg: Config, request: PipelineRequest) -> bool:
+    """True when the panel must stay hidden until the whole answer is written.
+
+    Default policy: the ``answer`` task combined with one of the two write modes
+    that click into a field and then type ("Click Target Once, Then Type" and
+    "Click Inside Area, Clear It, Type Answer"). Everything is configurable -
+    ``actions.hide_until_writing_done`` switches the feature off, and the task /
+    mode lists decide where it applies.
+    """
+    if not bool(cfg.get_path("actions.auto_hide_window", True)):
+        return False
+    if not bool(cfg.get_path("actions.hide_until_writing_done", True)):
+        return False
+    modes = [str(m) for m in (cfg.get_path("actions.hide_until_writing_modes", []) or [])]
+    if not modes or str(request.mode) not in modes:
+        return False
+    tasks = [str(t) for t in (cfg.get_path("actions.hide_until_writing_tasks", []) or [])]
+    if tasks and str(request.task_key) not in tasks:
+        return False
+    return True
+
+
 class PipelineWorker(QObject):
     status = Signal(str)
     log_line = Signal(str)
@@ -89,9 +114,12 @@ class PipelineWorker(QObject):
         self._last_answer: Optional[AiAnswer] = None
         self._last_ocr: Optional[OcrResult] = None
         self._pending_steps: List[Any] = []
+        # True when the panel must stay hidden from the first click until the
+        # answer has been written completely (see :func:`hold_panel_until_done`).
+        self._hold_hidden = False
         # Optional callbacks supplied by the GUI so it can move its own window
         # out of the way before capturing or sending input (occlusion handling).
-        self.pre_action_hook: Optional[Any] = None   # f(x, y, will_click) -> None
+        self.pre_action_hook: Optional[Any] = None   # f(x, y, will_click, hold) -> bool
         self.post_action_hook: Optional[Any] = None  # f() -> None
         self.pre_capture_hook: Optional[Any] = None  # f(region) -> None
         self.post_capture_hook: Optional[Any] = None  # f() -> None
@@ -102,6 +130,16 @@ class PipelineWorker(QObject):
     def stop(self) -> None:
         self._stop = True
         self.status.emit("Stopping...")
+
+    def apply_request(self, request: PipelineRequest) -> None:
+        """Remember a request and whether the panel must stay hidden while writing.
+
+        Called by :meth:`run` for every full pipeline run, and by the GUI before it
+        replays already-known answers (``execute_steps`` uses the remembered value
+        when no explicit flag is passed).
+        """
+        self._request = request
+        self._hold_hidden = hold_panel_until_done(self.cfg, request)
 
     def _emit_pointer(self, x: int, y: int, kind: str) -> None:
         """Relay a click location to the GUI so it can flash it (debug aid)."""
@@ -119,7 +157,7 @@ class PipelineWorker(QObject):
     def run(self, request: PipelineRequest) -> None:
         """Full pipeline: read screen -> ask AI -> (preview) -> act."""
         self._stop = False
-        self._request = request
+        self.apply_request(request)
         try:
             self.log_line.emit("[1/9] Run started")
             image = self._stage_capture(request)
@@ -217,7 +255,7 @@ class PipelineWorker(QObject):
         self.cfg.set_path("prompt.system", system)
         self.cfg.set_path("prompt.user_template", "{{TEXT}}")
         try:
-            return self.ai.ask(ocr_stub, task_key="answer", image=image)
+            return self.ai.ask(ocr_stub, task_key="answer", image=image, apply_limits=False)
         finally:
             self.cfg.set_path("prompt.system", saved_system)
             self.cfg.set_path("prompt.user_template", saved_template)
@@ -242,9 +280,26 @@ class PipelineWorker(QObject):
             self.failed.emit(str(exc))
             return None
         answer.latency_ms = int((time.time() - started) * 1000)
-        max_chars = int(self.cfg.get_path("ai.max_answer_chars", 1200))
-        if len(answer.text) > max_chars:
-            answer.text = answer.text[:max_chars].rstrip() + "..."
+        if answer.truncated:
+            self.log_line.emit(
+                "[5/9] Warning: the model stopped at its token limit, so the answer may be "
+                "incomplete. Raise ai.max_tokens or lower 'Max Answer Words'."
+            )
+        max_words = max_answer_words(self.cfg)
+        min_words = min_answer_words(self.cfg)
+        capped = cap_answer(answer.text, max_words, min_words)
+        if capped != answer.text:
+            self.log_line.emit(
+                f"[5/9] Answer trimmed to {max_words} words (raise 'Max Answer Words' "
+                "or set it to 0 to keep everything)."
+            )
+        answer.text = capped
+        words = count_words(answer.text)
+        if min_words > 0 and words < min_words:
+            self.log_line.emit(
+                f"[5/9] Answer has {words} words, below the {min_words}-word minimum - "
+                "the model ignored the length rule even after a retry."
+            )
         self.answer_ready.emit(answer)
         self._last_answer = answer
         self.log_line.emit(f"[5/9] AI replied: {answer.one_liner()}")
@@ -380,11 +435,21 @@ class PipelineWorker(QObject):
             return
         self.execute_steps(steps)
 
-    def execute_steps(self, steps: Optional[List[Any]] = None) -> None:
+    def execute_steps(
+        self, steps: Optional[List[Any]] = None, hold_hidden: Optional[bool] = None
+    ) -> None:
+        """Run the planned steps, hiding the panel for the whole input stage.
+
+        ``hold_hidden`` (default: the value remembered for the current request)
+        keeps the panel hidden from the first click until the answer has been
+        typed completely, for the "answer" task with a type-into-a-field mode.
+        """
         steps = steps if steps is not None else self._pending_steps
         self._pending_steps = []
         if not steps:
             return
+        if hold_hidden is None:
+            hold_hidden = self._hold_hidden
         pause_ms = int(self.cfg.get_path("actions.pause_after_answer_ms", 350))
         if pause_ms:
             time.sleep(pause_ms / 1000.0)
@@ -397,11 +462,15 @@ class PipelineWorker(QObject):
             for step in steps
         )
         point = self._first_input_point(steps)
-        self.log_line.emit("[7/9] Hiding the panel for the click")
+        if hold_hidden:
+            self.log_line.emit(
+                "[7/9] Hiding the panel until the answer has been written"
+            )
+        else:
+            self.log_line.emit("[7/9] Hiding the panel for the click")
         hidden = False
         try:
-            if self.pre_action_hook is not None:
-                hidden = bool(self.pre_action_hook(point[0], point[1], will_click))
+            hidden = self._call_pre_action_hook(point[0], point[1], will_click, hold_hidden)
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("pre_action_hook failed: %s", exc)
         self.log_line.emit(f"[8/9] Clicking ({point[0]},{point[1]})")
@@ -427,6 +496,27 @@ class PipelineWorker(QObject):
             self.log_line.emit(f"Actions completed ({result.executed} steps).")
         else:
             self.failed.emit(result.error or "Action failed.")
+
+    def _call_pre_action_hook(
+        self, x: int, y: int, will_click: bool, hold_hidden: bool
+    ) -> bool:
+        """Ask the GUI to move its window away; returns True when it is hidden.
+
+        The four-argument form lets the GUI keep the panel hidden until the whole
+        write action finished; hooks written for the older three-argument
+        signature are still accepted.
+        """
+        hook = self.pre_action_hook
+        if hook is None:
+            return False
+        try:
+            return bool(hook(int(x), int(y), bool(will_click), bool(hold_hidden)))
+        except TypeError as exc:
+            log.warning(
+                "pre_action_hook did not accept the hold flag (%s) - retrying with "
+                "the legacy 3-argument signature", exc,
+            )
+            return bool(hook(int(x), int(y), bool(will_click)))
 
     @staticmethod
     def _first_input_point(steps: List[Any]) -> tuple:
