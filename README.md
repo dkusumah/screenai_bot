@@ -1,5 +1,10 @@
 # ScreenAI Bot 🖥️🤖
 
+[![CI](https://github.com/dkusumah/screenai_bot/actions/workflows/ci.yml/badge.svg)](https://github.com/dkusumah/screenai_bot/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dkusumah/screenai_bot?sort=semver)](https://github.com/dkusumah/screenai_bot/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+
 A **desktop automation bot** that:
 
 1. **Reads text from a screen area you select** (fast `mss` capture + Tesseract OCR, or a vision LLM),
