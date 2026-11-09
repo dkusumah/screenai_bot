@@ -7,7 +7,16 @@
     "temperature": 0.2,
     "max_tokens": 800,
     "use_vision": false,
-    "timeout": 60
+    "timeout": 60,
+    "max_answer_words": 0,
+    "min_answer_words": 0,
+    "length_retries": 1,
+    "hallucination_level": 2,
+    "natural_answers": false,
+    "allow_markdown": false,
+    "allow_html": false,
+    "allow_code": false,
+    "allow_bullet_lists": false
   },
   "ocr": {
     "tesseract_cmd": null,
@@ -30,6 +39,10 @@
     "auto_hide_window": true,
     "auto_hide_delay_ms": 220,
     "auto_hide_max_ms": 8000,
+    "hide_until_writing_done": true,
+    "hide_until_writing_tasks": ["answer"],
+    "hide_until_writing_modes": ["type_in_region", "click_and_type"],
+    "auto_hide_writing_max_ms": 60000,
     "auto_hide_capture_mode": "always",
     "mcq_click_repeat": 2,
     "mcq_click_gap_ms": 600,
@@ -44,7 +57,7 @@
     "toggle_overlay": "ctrl+alt+h"
   },
   "prompt": {
-    "system": "You are ScreenAI, an assistant embedded in a desktop automation bot. You receive text captured from a specific region of the user's screen (via OCR), sometimes together with the screenshot of that region. Answer concisely and directly so the answer can be typed into a small on-screen field. Prefer plain text: no markdown, no code fences, no bullet lists unless asked. If the captured text is a question, answer it. If it is a statement or label, explain its meaning briefly. If it looks like a form field name, suggest what should be entered there. Never output more than {{MAX_CHARS}} characters.",
+    "system": "You are ScreenAI, an assistant embedded in a desktop automation bot. You receive text captured from a specific region of the user's screen (via OCR), sometimes together with the screenshot of that region. Answer concisely and directly so the answer can be typed into an on-screen field. If the captured text is a question, answer it. If it is a statement or label, explain its meaning briefly. If it looks like a form field name, suggest what should be entered there.",
     "user_template": "Screen region: {{REGION_NAME}}\nOCR confidence: {{CONFIDENCE}}%\n\nCaptured text:\n\"\"\"\n{{TEXT}}\n\"\"\"\n\nTask: {{TASK}}",
     "tasks": {
       "answer": "Answer the question contained in the captured text.",
@@ -56,7 +69,27 @@
       "custom": "{{CUSTOM}}"
     },
     "target_lang": "English",
-    "custom_instruction": "Rewrite the captured text politely and professionally."
+    "custom_instruction": "Rewrite the captured text politely and professionally.",
+    "length_rules": {
+      "min": "Write at least {{MIN_WORDS}} words.",
+      "max": "Keep the answer within {{MAX_WORDS}} words."
+    },
+    "format_features": {
+      "markdown": "Markdown formatting",
+      "html": "HTML tags",
+      "code": "code blocks",
+      "bullet_lists": "bullet or numbered lists"
+    },
+    "format_allow": "You may use {feature} when it makes the answer clearer.",
+    "format_deny": "Do not use {feature} in the answer.",
+    "hallucination_levels": [
+      "Grounding rule: answer using ONLY facts present in the captured text. If the text does not contain the answer, say plainly that the screen does not show it.",
+      "Grounding rule: base the answer on the captured text. Add outside knowledge only when it is certain and clearly relevant, and say briefly when the text itself does not answer the question.",
+      "Grounding rule: answer from the captured text and use general knowledge when that makes the answer clearly better; mention uncertainty in a few words when it exists.",
+      "Grounding rule: answer even when the captured text is thin - fill small gaps with the most plausible explanation and name any assumption in a short phrase.",
+      "Grounding rule: never refuse and never hedge. Give the most likely answer even if the captured text is incomplete, inventing plausible details when that produces a usable answer."
+    ],
+    "natural_style": "Answer like a real person typing into a chat box: everyday words and contractions, no preamble such as 'Sure' or 'The answer is', and never restate the question."
   },
   "output": {
     "mode": "type",
@@ -69,5 +102,24 @@
     "show_log": true,
     "show_options": false,
     "show_ai": false
+  },
+  "app": {
+    "run_in_background": true,
+    "start_minimized": false,
+    "hide_dock_icon": true,
+    "tray_notifications": true,
+    "hotkey_max_restarts": 2
+  },
+  "debug": {
+    "sounds": false,
+    "sound_volume": 0.5,
+    "sound_hotkey": true,
+    "sound_hotkey_miss": false,
+    "sound_click": true,
+    "sound_type": true,
+    "sound_start": false,
+    "sound_done": true,
+    "sound_error": true,
+    "sound_cancel": true
   }
 }
