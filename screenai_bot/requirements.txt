@@ -6,6 +6,13 @@ pytesseract>=0.3.10  # OCR engine wrapper (needs the Tesseract binary installed)
 pynput>=1.7.6        # global hotkeys
 keyboard>=0.13.5     # OPTIONAL fallback hotkey backend (Windows only, run as admin)
 
+# --- macOS only: permission checks + menu-bar (Dock icon) policy -------------
+# Guarded by an environment marker so Windows/Linux installs are unaffected
+# (pynput pulls these in on macOS anyway; native.py imports them directly).
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
+
 # --- Input simulation ---
 pyautogui>=0.9.54    # mouse clicks + typing
 

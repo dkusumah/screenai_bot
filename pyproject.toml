@@ -21,6 +21,13 @@ dependencies = [
 
 [project.optional-dependencies]
 vision = ["openai>=1.30.0"]
+# Only needed on macOS: read from pynput already, declared here because the app
+# queries the permission state and the Dock icon policy directly (native.py).
+macos = [
+    "pyobjc-framework-Cocoa>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "pyobjc-framework-ApplicationServices>=10.0",
+]
 
 [project.scripts]
 screenai-bot = "screenai_bot:run_gui"
